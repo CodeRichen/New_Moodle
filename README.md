@@ -7,3 +7,4 @@
 - 直接複製我的原始碼
 - 找到程式碼當中TODO的部分，自行修改password的讀取位置及讀取方式(可用AI)
 - 若遇到問題(檔案下載出現錯誤,執行被中斷等)可以直接修改並PR
+## 使用說明 https://hackmd.io/wJQ18WJPRYO5IXklfe0_GQ
