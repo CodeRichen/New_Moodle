@@ -3,11 +3,11 @@
 
 import os
 import sys
-
-# ========== 🖥️ 使用 ANSI 指令調整終端機視窗大小 ==========
+import ctypes
+# ========== 使用 ANSI 指令調整終端機視窗大小 ==========
 # ANSI escape sequence: \x1b[8;高度;寬度t
 # 這個方法在大多數終端機中都有效（包括 Windows Terminal 和 conhost）
-sys.stdout.write("\x1b[8;40;130t")  # 高度 40 行，寬度 130 列
+sys.stdout.write("\x1b[8;38;120t") 
 sys.stdout.flush()
 
 os.environ['WDM_LOG_LEVEL'] = '0' # 針對 webdriver-manager 的日誌屏蔽
@@ -46,12 +46,15 @@ except ImportError:
 YELLOW = "\033[33m"
 RED = "\033[31m"
 BLUE = "\033[34m"
+BBLUE = "\033[94m"
+MIKU = "\033[36m"
 GREEN = "\033[32m"
 PURPLE = "\033[38;5;129m"  # 亮紫紅色/洋紅色
 ORANGE = "\033[38;5;214m"  # 黃橘色
 RESET = "\033[0m"
+PINK = "\033[38;2;255;220;225m"
 
-# ========== 📁 路徑設定區域（修改這裡可以改變所有檔案存放位置）==========
+# ========== TODO 路徑設定區域（修改這裡可以改變所有檔案存放位置）==========
 # 主要下載目錄 - 修改這裡就能改變所有檔案的存放位置
 # 例如：r"D:\Moodle" 或 r"E:\課程資料"
 BASE_DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "class")
@@ -723,7 +726,7 @@ def wait_for_download(filename, download_path=None, timeout=300, ask_after=3, si
                         return None
                     continue
             
-            print(f"{GREEN}✅ 下載完成：{filename}{RESET}")
+            # print(f"{GREEN}✅ 下載完成：{filename}{RESET}")
             return file_path
 
         elapsed = time.time() - start
@@ -923,7 +926,7 @@ if red_activities_to_print:
 # 輸出紅色活動資訊並下載
 if red_activities_to_print:
     print("\n" + "="*60)
-    print("🔻 以下為新增活動")
+    print(f"{PINK}🔻 以下為新增活動{RESET}")
     print("="*60 + "\n")
     
     total_downloaded_files = 0  # 追蹤總下載檔案數
@@ -943,7 +946,7 @@ if red_activities_to_print:
             continue
             
         print(f"\n{RED}━━━ {name} ━━━{RESET}")
-        print(f"課程：{course_name}")
+        print(f"{PINK}課程：{course_name}{RESET}")
         print(f"週次：{week_header}")
         print(f"活動連結：{link}")
         print(f"儲存位置：{course_path}\n")
@@ -1094,15 +1097,15 @@ if red_activities_to_print:
                     if not download_links:
                         # 可能還有 .crdownload 正在下載
                         if crdownload_files:
-                            print(f"   ⏳ 發現 {len(crdownload_files)} 個正在下載的檔案")
+                            # print(f"   ⏳ 發現 {len(crdownload_files)} 個正在下載的檔案")
                             # 等待 .crdownload 完成
                             for cr_file in crdownload_files:
                                 base_filename = cr_file[:-11]  # 移除 .crdownload
-                                print(f"   ⏳ 等待下載完成: {base_filename}")
+                                # print(f"   ⏳ 等待下載完成: {base_filename}")
                                 file_path = wait_for_download(base_filename, download_path=course_path)
                                 if file_path and file_path != 'SKIP_COURSE':
                                     if base_filename.lower().endswith(('.htm', '.html')):
-                                        print(f"   ⏭️  跳過 HTML 文件: {base_filename}")
+                                        # print(f"   ⏭️  跳過 HTML 文件: {base_filename}")
                                         try:
                                             os.remove(file_path)
                                         except:
@@ -1122,20 +1125,20 @@ if red_activities_to_print:
                                             success = extract_file(file_path, course_path)
                                             if success:
                                                 os.remove(file_path)
-                                                print(f"   ✅ 解壓完成並刪除原始檔")
+                                                # print(f"   {GREEN}✅ 解壓完成並刪除原始檔{RESET}")
                             continue
                         
-                        print(f"{YELLOW}⚠️  此資源頁面沒有附件，跳過{RESET}")
+                        # print(f"{YELLOW}⚠️  此資源頁面沒有附件，跳過{RESET}")
                         continue
                     
                     for link_elem in download_links:
                         dl_href = link_elem.get_attribute("href")
                         filename = extract_filename_from_url(dl_href)
-                        print(f"   📎 發現文件: {filename}")
+                        # print(f"   📎 發現文件: {filename}")
                         
                         # 過濾掉不需要的文件類型（如 downloads.htm）
                         if filename.lower().endswith(('.htm', '.html')):
-                            print(f"   ⏭️  跳過 HTML 文件: {filename}")
+                            # print(f"   ⏭️  跳過 HTML 文件: {filename}")
                             continue
                         
                         print(f"🔽 開始下載: {filename} (新增活動，覆蓋舊檔)")
@@ -1165,7 +1168,7 @@ if red_activities_to_print:
                                     os.remove(file_path)
                                 continue
                             
-                            print(f"{GREEN}✅ 下載完成：{filename} ({file_size / 1024:.1f} KB){RESET}")
+                            # print(f"{GREEN}✅ 下載完成：{filename} ({file_size / 1024:.1f} KB){RESET}")
                             files_to_unblock.append(file_path)
                             downloaded_files.add(filename)
                             existing_files.add(filename)
@@ -1638,7 +1641,7 @@ assignment_check_thread.start()
 
 # 在結束前詢問是否要開啟任何課程資料夾
 
-print("開啟以下課程的資料夾：")
+print(f"{PINK}開啟以下課程的資料夾：{RESET}")
 
 
 # 收集所有課程資料夾（直接使用已有的 course_results 數據）
@@ -1653,22 +1656,22 @@ for idx, result in course_results:
 red_course_names = set()
 for name, link, course_name, week_header, course_path, course_url in red_activities_to_print:
     red_course_names.add(course_name)
-
+ibxx=0
 for idx, (course_name, course_path) in enumerate(all_courses.items(), 1):
     if course_name in red_course_names:
-        print(f"{RED}{idx}. {course_name} (有新活動){RESET}")
+        print(f"  {RED}{idx}. {course_name} (NEW){RESET}")
     else:
-        print(f"{idx}. {course_name}")
-
-choice = input("\n請輸入編號（或輸入 'u' 繳交作業，可用空白分隔多個編號）: ").strip().lower()
+        if ibxx%2==0:
+            print(f"  {MIKU}{idx}. {course_name}{RESET}")
+        else:
+            print(f"  {BBLUE}{idx}. {course_name}{RESET}")
+    ibxx += 1
+choice = input(f"\n{PINK}請輸入編號（或輸入 'u' 繳交作業，可用空白分隔多個編號）: {RESET}").strip().lower()
 
 # 支援空白分隔多個編號
 choice_parts = choice.split()
 
 if choice == 'u':
-    print("\n" + "="*60)
-    print("📝 開啟未繳交作業繳交頁面...")
-    print("="*60 + "\n")
     
     # 如果作業檢查還沒完成，等待完成
     if not assignment_check_completed:
@@ -1679,28 +1682,24 @@ if choice == 'u':
         print(f"\n{YELLOW}找到 {len(empty_assignments)} 個未繳交作業{RESET}")
         
         # 列出所有未繳交作業
-        print("\n完整清單：")
+        print(f"\n{PINK}完整清單：{RESET}")
+        ibxx=0
         for idx, item in enumerate(empty_assignments, 1):
-            print(f"  {idx}. [{item['course']}] {item['name']}")
+            if ibxx%2==0:
+                print(f" {BBLUE} {idx}. [{item['course']}] {item['name']}{RESET}")
+            else:
+                print(f" {MIKU} {idx}. [{item['course']}] {item['name']}{RESET}")
+            ibxx += 1
         
         # 詢問要開啟哪些作業
-        print("\n請輸入要開啟的作業編號（多個用空白分隔，或輸入 'a' 開啟全部）")
-        selection = input("輸入: ").strip().lower()
+        selection = input(f"{PINK}請輸入要開啟的作業編號（可個用空白分隔): {RESET}").strip().lower()
         
         selected_assignments = []
-        if selection in ('', 'q'):
-            print("已取消")
-        elif selection == 'a':
+        if selection == 'a':
             selected_assignments = empty_assignments
         else:
-            try:
-                indices = [int(x) - 1 for x in selection.split() if x.strip()]
-                selected_assignments = [empty_assignments[i] for i in indices if 0 <= i < len(empty_assignments)]
-                if not selected_assignments:
-                    print("已取消")
-            except:
-                print("已取消")
-                selected_assignments = []
+            indices = [int(x) - 1 for x in selection.split() if x.strip()]
+            selected_assignments = [empty_assignments[i] for i in indices if 0 <= i < len(empty_assignments)]
         
         if selected_assignments:
 
