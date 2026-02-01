@@ -1,14 +1,20 @@
-# pip install selenium webdriver-manager colorama patool
+# pip install selenium webdriver-manager colorama requests py7zr patool rarfile
 # 不要在開啟Moodle網頁的狀態執行程式
 
 import os
 import sys
 import ctypes
-# ========== 使用 ANSI 指令調整終端機視窗大小 ==========
-# ANSI escape sequence: \x1b[8;高度;寬度t
-# 這個方法在大多數終端機中都有效（包括 Windows Terminal 和 conhost）
-sys.stdout.write("\x1b[8;38;120t") 
-sys.stdout.flush()
+
+# ========== 使用 Windows API 設定終端機視窗為全螢幕 ==========
+def maximize_console_window():
+    """將終端機視窗最大化"""
+    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+    if hwnd:
+        # SW_MAXIMIZE = 3
+        ctypes.windll.user32.ShowWindow(hwnd, 3)
+
+# 執行視窗最大化
+maximize_console_window()
 
 os.environ['WDM_LOG_LEVEL'] = '0' # 針對 webdriver-manager 的日誌屏蔽
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  #關閉 TensorFlow 的日誌
@@ -68,9 +74,119 @@ PASSWORD_FILE = os.path.join(BASE_DOWNLOAD_DIR, "password.txt")
 # 確保主目錄存在
 os.makedirs(BASE_DOWNLOAD_DIR, exist_ok=True)
 
+# 初始化第一次使用標記
+IS_FIRST_TIME = False
+
+def get_password_input(prompt):
+    """自定義密碼輸入函數，顯示星號"""
+    import msvcrt
+    print(prompt, end='', flush=True)
+    password = ""
+    while True:
+        char = msvcrt.getch()
+        if char == b'\r':  # Enter鍵
+            break
+        elif char == b'\x08':  # Backspace鍵
+            if len(password) > 0:
+                password = password[:-1]
+                print('\b \b', end='', flush=True)
+        elif char == b'\x03':  # Ctrl+C
+            print()
+            sys.exit(1)
+        else:
+            try:
+                password += char.decode('utf-8')
+                print('*', end='', flush=True)
+            except UnicodeDecodeError:
+                # 忽略無法解碼的字符
+                pass
+    print()  # 換行
+    return password
+
+def test_login(username, password):
+    """測試登入是否成功，使用現有的登入函數"""
+    try:
+        # 創建臨時瀏覽器進行登入測試
+        test_chrome_options = Options()
+        test_chrome_options.add_argument("--headless")
+        test_chrome_options.add_argument("--disable-gpu")
+        test_chrome_options.add_argument("--log-level=3")
+        test_chrome_options.add_argument("--disable-extensions")
+        test_chrome_options.add_argument("--disable-dev-shm-usage")
+        test_chrome_options.add_argument("--no-sandbox")
+        test_chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
+        
+        test_service = Service(log_path=os.devnull)
+        test_service.creation_flags = subprocess.CREATE_NO_WINDOW
+        test_driver = webdriver.Chrome(options=test_chrome_options, service=test_service)
+        
+        # 使用現有的登入函數邏輯
+        test_driver.get("https://elearningv4.nuk.edu.tw/login/index.php?loginredirect=1")
+        WebDriverWait(test_driver, 10).until(
+            EC.visibility_of_element_located((By.ID, "username"))
+        ).send_keys(username)
+        
+        # 使用現有的 simulate_typing 函數邏輯
+        password_script = f"""
+        var element = document.getElementById('password');
+        element.focus();
+        element.value = '';
+        
+        // 模擬逐字輸入
+        var text = '{password}';
+        for (let i = 0; i < text.length; i++) {{
+            element.value += text[i];
+            element.dispatchEvent(new KeyboardEvent('keydown', {{
+                key: text[i],
+                char: text[i],
+                bubbles: true
+            }}));
+            element.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            element.dispatchEvent(new KeyboardEvent('keyup', {{
+                key: text[i],
+                char: text[i],
+                bubbles: true
+            }}));
+        }}
+        
+        element.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        element.blur();
+        """
+        test_driver.execute_script(password_script)
+        test_driver.execute_script("document.getElementById('loginbtn').click();")
+        time.sleep(2)  # 等待登入處理
+        
+        # 檢查是否有錯誤警告
+        try:
+            error_alert = test_driver.find_element(By.CSS_SELECTOR, "div.alert.alert-danger")
+            if "帳號不存在或密碼錯誤" in error_alert.text:
+                test_driver.quit()
+                return False
+        except:
+            pass
+        
+        # 檢查是否被重新導向到登入頁面（表示登入失敗）
+        current_url = test_driver.current_url
+        if "login" in current_url:
+            test_driver.quit()
+            return False
+        
+        # 登入成功
+        test_driver.quit()
+        return True
+        
+    except Exception as e:
+        try:
+            test_driver.quit()
+        except:
+            pass
+        return False
+
 # 讀取帳號密碼
 def load_credentials():
-    """從 password.txt 讀取帳號密碼"""
+    """從 password.txt 讀取帳號密碼，如果不存在則讓使用者輸入並創建"""
+    global IS_FIRST_TIME  # 使用全域變數來追蹤是否為第一次使用
+    
     try:
         if os.path.exists(PASSWORD_FILE):
             with open(PASSWORD_FILE, 'r', encoding='utf-8') as f:
@@ -81,16 +197,9 @@ def load_credentials():
                     if not username or not password:
                         print(f"\n{RED}{'='*60}{RESET}")
                         print(f"{RED}❌ 錯誤：password.txt 檔案內容不完整{RESET}")
-                        print(f"{RED}{'='*60}{RESET}")
-                        print(f"\n{YELLOW}檢查到檔案存在，但帳號或密碼為空{RESET}")
-                        print(f"\n📁 檔案位置：{PASSWORD_FILE}")
-                        print(f"\n✅ 正確格式：")
-                        print(f"   第 1 行：你的學號")
-                        print(f"   第 2 行：你的密碼")
-                        print(f"\n{YELLOW}⚠️  註意：不要有額外的空白行或空格{RESET}")
-                        print(f"\n按 Enter 鍵離開...")
                         input()
                         sys.exit(1)
+                    IS_FIRST_TIME = False
                     return username, password
                 else:
                     print(f"\n{RED}{'='*60}{RESET}")
@@ -105,17 +214,42 @@ def load_credentials():
                     input()
                     sys.exit(1)
         else:
-            print(f"\n{RED}{'='*60}{RESET}")
-            print(f"{RED}❌ 錯誤：找不到 password.txt 檔案{RESET}")
-            print(f"{RED}{'='*60}{RESET}")
-            print(f"\n{YELLOW}程式需要讀取你的帳號密碼才能執行{RESET}")
-            print(f"\n📝 請建立檔案：{PASSWORD_FILE}")
-            print(f"\n✅ 檔案格式：")
-            print(f"   第 1 行：你的學號")
-            print(f"   第 2 行：你的密碼")
-            print(f"\n按 Enter 鍵離開...")
-            input()
-            sys.exit(1)
+            # 第一次使用，讓使用者輸入帳號密碼
+            IS_FIRST_TIME = True
+            print(f"{YELLOW}請輸入你的 Moodle 帳號密碼：{RESET}")
+            
+            while True:  # 持續輸入直到登入成功
+                username = input(f"{PINK}學號：{RESET}").strip()
+                while not username:
+                    print(f"{RED}學號不能為空，請重新輸入{RESET}")
+                    username = input(f"{PINK}學號：{RESET}").strip()
+                
+                password = get_password_input(f"{PINK}密碼：{RESET}")
+                while not password:
+                    print(f"{RED}密碼不能為空，請重新輸入{RESET}")
+                    password = get_password_input(f"{PINK}密碼：{RESET}")
+                
+                # 測試登入
+ 
+                if test_login(username, password):
+
+                    break
+                else:
+                    print(f"\n{RED}❌ 帳號不存在或密碼錯誤，請重新輸入{RESET}")
+                    continue
+            
+            # 登入成功，創建 password.txt 檔案
+            try:
+                with open(PASSWORD_FILE, 'w', encoding='utf-8') as f:
+                    f.write(f"{username}\n{password}\n")
+                print(f"\n{BLUE}建置環境中{RESET}")
+                return username, password
+            except Exception as e:
+                print(f"\n{RED}❌ 無法創建密碼檔案：{e}{RESET}")
+                print(f"按 Enter 鍵離開...")
+                input()
+                sys.exit(1)
+                
     except Exception as e:
         print(f"\n{RED}{'='*60}{RESET}")
         print(f"{RED}❌ 錯誤：讀取 password.txt 失敗{RESET}")
@@ -589,83 +723,86 @@ with ThreadPoolExecutor(max_workers=len(all_tabs)) as executor:
             course_results.append((idx, result))  # 保存索引
             
             # 立即輸出黃色資訊（本週、下週、最新週的舊活動）
-            with output_lock:
-                weeks_to_show = []
-                
-                # 1. 本週
-                if result['current_week_info']:
-                    weeks_to_show.append(result['current_week_info'])
-                
-                # 2. 下週（如果有）
-                if result['next_week_info']:
-                    weeks_to_show.append(result['next_week_info'])
-                
-                # 3. 最新週（如果與本週/下週不重複）
-                if result['latest_with_content']:
-                    latest_week_num = result['latest_with_content'][0]
-                    current_week_num = result['current_week_info'][0] if result['current_week_info'] else None
-                    next_week_num = result['next_week_info'][0] if result['next_week_info'] else None
+            # 如果是第一次使用，跳過輸出
+            if not IS_FIRST_TIME:
+                with output_lock:
+                    weeks_to_show = []
                     
-                    if latest_week_num == current_week_num:
-                        # 最新週就是本週，不重複輸出但要註明
-                        if result['current_week_info']:
-                            info = result['current_week_info']
-                            weeks_to_show[0] = (info[0], info[1], info[2], info[3], info[4], '本週（最新週）')
-                    elif latest_week_num == next_week_num:
-                        # 最新週就是下週，不重複輸出但要註明
-                        for i, info in enumerate(weeks_to_show):
-                            if info[5] == '下週':
-                                weeks_to_show[i] = (info[0], info[1], info[2], info[3], info[4], '下週（最新週）')
-                    elif latest_week_num != current_week_num and latest_week_num != next_week_num:
-                        # 最新週與本週和下週都不同，額外輸出
-                        info = result['latest_with_content']
-                        weeks_to_show.append((info[0], info[1], info[2], info[3], info[4], '最新週'))
-                
-                # 輸出所有需要顯示的週次
-                course_name_printed = False  # 追蹤課程名稱是否已輸出
-                for week_info in weeks_to_show:
-                    if week_info and week_info[0] != 1:  # 不是第一週
-                        # week_info = (week_num, course_name, week_header, activities, course_path, week_label)
-                        week_label = week_info[5] if len(week_info) > 5 else None
+                    # 1. 本週
+                    if result['current_week_info']:
+                        weeks_to_show.append(result['current_week_info'])
+                    
+                    # 2. 下週（如果有）
+                    if result['next_week_info']:
+                        weeks_to_show.append(result['next_week_info'])
+                    
+                    # 3. 最新週（如果與本週/下週不重複）
+                    if result['latest_with_content']:
+                        latest_week_num = result['latest_with_content'][0]
+                        current_week_num = result['current_week_info'][0] if result['current_week_info'] else None
+                        next_week_num = result['next_week_info'][0] if result['next_week_info'] else None
                         
-                        # 如果是下週但沒有活動，跳過
-                        if week_label == '下週' and not week_info[3]:
-                            continue
-                        
-                        # 課程名稱只輸出一次（綠色）
-                        if not course_name_printed:
-                            print(f"\n{GREEN}{week_info[1]}{RESET}")
-                            course_name_printed = True
-                        
-                        # 根據標籤選擇顏色和輸出格式（縮排2格）
-                        if week_label:
-                            # 處理本週（最新週）的情況
-                            if week_label == '本週（最新週）':
-                                # 整體用最新週的紫色，但「本週」用黃橘色
-                                print(f"  {PURPLE}{week_info[2]} ({ORANGE}本週{PURPLE}（最新週）){RESET}")
-                            # 處理下週（最新週）的情況
-                            elif week_label == '下週（最新週）':
-                                # 整體用最新週的紫色，但「下週」用藍色
-                                print(f"  {PURPLE}{week_info[2]} ({BLUE}下週{PURPLE}（最新週）){RESET}")
-                            # 單獨的本週
-                            elif week_label == '本週':
-                                print(f"  {ORANGE}{week_info[2]} (本週){RESET}")
-                            # 單獨的下週
-                            elif week_label == '下週':
-                                print(f"  {BLUE}{week_info[2]} (下週){RESET}")
-                            # 單獨的最新週
-                            elif week_label == '最新週':
-                                print(f"  {PURPLE}{week_info[2]} (最新週){RESET}")
+                        if latest_week_num == current_week_num:
+                            # 最新週就是本週，不重複輸出但要註明
+                            if result['current_week_info']:
+                                info = result['current_week_info']
+                                weeks_to_show[0] = (info[0], info[1], info[2], info[3], info[4], '本週（最新週）')
+                        elif latest_week_num == next_week_num:
+                            # 最新週就是下週，不重複輸出但要註明
+                            for i, info in enumerate(weeks_to_show):
+                                if info[5] == '下週':
+                                    weeks_to_show[i] = (info[0], info[1], info[2], info[3], info[4], '下週（最新週）')
+                        elif latest_week_num != current_week_num and latest_week_num != next_week_num:
+                            # 最新週與本週和下週都不同，額外輸出
+                            info = result['latest_with_content']
+                            weeks_to_show.append((info[0], info[1], info[2], info[3], info[4], '最新週'))
+                    
+                    # 輸出所有需要顯示的週次
+                    course_name_printed = False  # 追蹤課程名稱是否已輸出
+                    for week_info in weeks_to_show:
+                        if week_info and week_info[0] != 1:  # 不是第一週
+                            # week_info = (week_num, course_name, week_header, activities, course_path, week_label)
+                            week_label = week_info[5] if len(week_info) > 5 else None
+                            
+                            # 如果是下週但沒有活動，跳過
+                            if week_label == '下週' and not week_info[3]:
+                                continue
+                            
+                            # 課程名稱只輸出一次（綠色）
+                            if not course_name_printed:
+                                print(f"\n{GREEN}{week_info[1]}{RESET}")
+                                course_name_printed = True
+                            
+                            # 根據標籤選擇顏色和輸出格式（縮排2格）
+                            if week_label:
+                                # 處理本週（最新週）的情況
+                                if week_label == '本週（最新週）':
+                                    # 整體用最新週的紫色，但「本週」用黃橘色
+                                    print(f"  {PURPLE}{week_info[2]} ({ORANGE}本週{PURPLE}（最新週）){RESET}")
+                                # 處理下週（最新週）的情況
+                                elif week_label == '下週（最新週）':
+                                    # 整體用最新週的紫色，但「下週」用藍色
+                                    print(f"  {PURPLE}{week_info[2]} ({BLUE}下週{PURPLE}（最新週）){RESET}")
+                                # 一般情況
+                                elif week_label == '本週':
+                                    print(f"  {ORANGE}{week_info[2]} ({ORANGE}本週{ORANGE}){RESET}")
+                                # 一般下週情況
+                                elif week_label == '下週':
+                                    print(f"  {BLUE}{week_info[2]} ({BLUE}下週{BLUE}){RESET}")
+                                # 只是最新週
+                                elif week_label == '最新週':
+                                    print(f"  {PURPLE}{week_info[2]} ({PURPLE}最新週{PURPLE}){RESET}")
+                                else:
+                                    print(f"  {week_info[2]} ({week_label})")
                             else:
-                                print(f"  {week_info[2]} ({week_label})")
-                        else:
-                            print(f"  {week_info[2]}")
-                        
-                        # 顯示所有活動（無論新舊）（縮排2格）
-                        for name, href_link in week_info[3]:
-                            # 活動名稱維持黃色，網址改為白色（預設）
-                            print(f"  {YELLOW}{name}{RESET} - {href_link}")
-                        print("")
+                                print(f"  {week_info[2]}")
+                            
+                            # 顯示所有活動（無論新舊）（縮排2格）
+                            for name, href_link in week_info[3]:
+                                # 活動名稱維持黃色，網址改為白色（預設）
+                                print(f"  {YELLOW}{name}{RESET} - {href_link}")
+                            print("")
+                             
             
             # 收集資料
             with data_lock:
@@ -925,9 +1062,11 @@ if red_activities_to_print:
 
 # 輸出紅色活動資訊並下載
 if red_activities_to_print:
-    print("\n" + "="*60)
-    print(f"{PINK}🔻 以下為新增活動{RESET}")
-    print("="*60 + "\n")
+    # 如果是第一次使用，跳過這些輸出和下載
+    if not IS_FIRST_TIME:
+        print("\n" + "="*60)
+        print(f"{PINK}🔻 以下為新增活動{RESET}")
+        print("="*60 + "\n")
     
     total_downloaded_files = 0  # 追蹤總下載檔案數
     
@@ -945,11 +1084,13 @@ if red_activities_to_print:
         if course_name in skipped_courses:
             continue
             
-        print(f"\n{RED}━━━ {name} ━━━{RESET}")
-        print(f"{PINK}課程：{course_name}{RESET}")
-        print(f"週次：{week_header}")
-        print(f"活動連結：{link}")
-        print(f"儲存位置：{course_path}\n")
+        # 如果是第一次使用，跳過詳細輸出
+        if not IS_FIRST_TIME:
+            print(f"\n{RED}━━━ {name} ━━━{RESET}")
+            print(f"{PINK}課程：{course_name}{RESET}")
+            print(f"週次：{week_header}")
+            print(f"活動連結：{link}")
+            print(f"儲存位置：{course_path}\n")
         
         # 確保每次都重新設定下載路徑到正確的課程資料夾（用於資料夾/作業的 Selenium 下載）
         driver.execute_cdp_cmd("Page.setDownloadBehavior", {
@@ -1469,7 +1610,7 @@ if red_activities_to_print:
 # 資料夾/作業下載若有問題，wait_for_download() 會在當下處理
 
 # 顯示下載失敗的連結
-if failed_downloads:
+if failed_downloads and not IS_FIRST_TIME:
     print("\n" + "="*60)
     print(f"{RED}❌ 以下檔案下載失敗，請手動下載：{RESET}")
     print("="*60)
@@ -1485,21 +1626,24 @@ for root, dirs, files in os.walk(download_dir):
     for file in files:
         filepath = os.path.join(root, file)
         if file.endswith((".zip", ".rar", ".7z")):
+            if not IS_FIRST_TIME:
+                print(f"📦 解壓縮: {os.path.basename(file)}")
 
             success = extract_file(filepath, root)
             if success:
                 os.remove(filepath)
-                print(f"   ✅ 完成並刪除原始檔")
+                if not IS_FIRST_TIME:
+                    print(f"   ✅ 完成並刪除原始檔")
                 extracted_count += 1
             else:
                 # 記錄失敗的檔案（特別是 RAR）
                 if file.endswith(".rar"):
                     failed_extract.append(filepath)
 
-if extracted_count > 0:
+if extracted_count > 0 and not IS_FIRST_TIME:
     print(f"\n{GREEN}✅ 解壓縮完成，共處理 {extracted_count} 個檔案{RESET}")
 
-if failed_extract:
+if failed_extract and not IS_FIRST_TIME:
     print(f"\n{YELLOW}⚠️  以下檔案因工具缺失而未解壓：{RESET}")
     for f in failed_extract:
         print(f"   - {os.path.basename(f)}")
@@ -1640,6 +1784,21 @@ assignment_check_thread = threading.Thread(target=check_assignments_background, 
 assignment_check_thread.start()
 
 # 在結束前詢問是否要開啟任何課程資料夾
+# 如果是第一次使用，跳過選擇並直接結束
+if IS_FIRST_TIME:
+    print(f"\n{GREEN}環境建置完成{RESET}")
+    print(f"\n{YELLOW}可在下次上課前再次執行此程式{RESET}")
+    
+    # 程式結束前關閉所有分頁（在背景線程中執行避免卡頓）
+    def cleanup_driver():
+        try:
+            driver.quit()
+        except:
+            pass
+    
+    cleanup_thread = threading.Thread(target=cleanup_driver, daemon=True)
+    cleanup_thread.start()
+    sys.exit(0)
 
 print(f"{PINK}開啟以下課程的資料夾：{RESET}")
 
