@@ -1461,7 +1461,6 @@ if red_activities_to_print:
             # Case 3: URL 類型活動 - 提取並顯示實際連結
             if "mod/url/view.php" in link:
                 try:
-                    print(f"🔗 訪問 URL 活動頁面...")
                     driver.get(link)
                     time.sleep(0.2)
                     
@@ -1552,7 +1551,6 @@ if red_activities_to_print:
             # Case 4: 討論區類型活動 - 提取文字內容並儲存
             if "mod/forum/view.php" in link:
                 try:
-                    print(f"💬 訪問討論區頁面...")
                     driver.get(link)
                     wait = WebDriverWait(driver, 5)
                     
