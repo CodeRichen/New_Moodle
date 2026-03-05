@@ -7,11 +7,20 @@ import ctypes
 
 # ========== 使用 Windows API 設定終端機視窗為全螢幕 ==========
 def maximize_console_window():
-    """將終端機視窗最大化"""
-    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-    if hwnd:
-        # SW_MAXIMIZE = 3
-        ctypes.windll.user32.ShowWindow(hwnd, 3)
+    """將終端機視窗最大化（僅在非 exe 環境下執行）"""
+    try:
+        # 檢查是否在 PyInstaller 打包環境中
+        if getattr(sys, 'frozen', False):
+            # 在打包的 exe 中，跳過視窗操作避免卡頓
+            return
+        
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            # SW_MAXIMIZE = 3
+            ctypes.windll.user32.ShowWindow(hwnd, 3)
+    except Exception:
+        # 忽略視窗操作錯誤，避免影響程式執行
+        pass
 
 # 執行視窗最大化
 maximize_console_window()
@@ -36,6 +45,32 @@ import json
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+
+# 全域變數儲存 ChromeDriver 路徑，避免重複下載
+_cached_driver_path = None
+
+def get_chrome_driver_path():
+    """獲取 ChromeDriver 路徑，包含重試機制和回退方案"""
+    global _cached_driver_path
+    
+    # 如果已經快取，直接返回
+    if _cached_driver_path:
+        return _cached_driver_path
+    
+    # 嘗試使用 webdriver-manager（最多重試3次）
+    for attempt in range(3):
+        try:
+            _cached_driver_path = ChromeDriverManager().install()
+            return _cached_driver_path
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1)  # 等待1秒後重試
+                continue
+    
+    # 回退方案：返回 None，讓 Selenium 自動尋找 ChromeDriver
+    return None
+
 # 嘗試導入 RAR 解壓工具
 try:
     import patool
@@ -50,15 +85,17 @@ except ImportError:
     HAS_RARFILE = False
 
 YELLOW = "\033[33m"
-RED = "\033[31m"
+RED = "\033[38;2;255;105;180m"
 BLUE = "\033[34m"
 BBLUE = "\033[94m"
+ITALIC = "\033[3;37m"
 MIKU = "\033[36m"
-GREEN = "\033[32m"
-PURPLE = "\033[38;5;129m"  # 亮紫紅色/洋紅色
+LOWGREEN = "\033[32m"
+GREEN = "\033[38;2;055;205;180m"
+PURPLE = "\033[38;5;129m"  # 亮紫紅色
 ORANGE = "\033[38;5;214m"  # 黃橘色
 RESET = "\033[0m"
-PINK = "\033[38;2;255;220;225m"
+PINK = "\033[38;2;255;220;255m"
 
 # ========== TODO 路徑設定區域（修改這裡可以改變所有檔案存放位置）==========
 # 主要下載目錄 - 修改這裡就能改變所有檔案的存放位置
@@ -116,9 +153,13 @@ def test_login(username, password):
         test_chrome_options.add_argument("--no-sandbox")
         test_chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
         
-        test_service = Service(log_path=os.devnull)
-        test_service.creation_flags = subprocess.CREATE_NO_WINDOW
-        test_driver = webdriver.Chrome(options=test_chrome_options, service=test_service)
+        driver_path = get_chrome_driver_path()
+        if driver_path:
+            test_service = Service(driver_path, log_path=os.devnull)
+            test_service.creation_flags = subprocess.CREATE_NO_WINDOW
+            test_driver = webdriver.Chrome(options=test_chrome_options, service=test_service)
+        else:
+            test_driver = webdriver.Chrome(options=test_chrome_options)
         
         # 使用現有的登入函數邏輯
         test_driver.get("https://elearningv4.nuk.edu.tw/login/index.php?loginredirect=1")
@@ -269,6 +310,26 @@ USERNAME, PASSWORD = load_credentials()
 def is_activity(text):
     return not (text.startswith("第") and text.endswith("週")) and text.strip()
 
+def clean_activity_name(text):
+    """清理活動名稱中的換行字元和亂碼"""
+    if not text:
+        return text
+    
+    # 移除各種換行字元和不需要的空白字元
+    cleaned = text.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+    
+    # 移除多餘的空格
+    cleaned = ' '.join(cleaned.split())
+    
+    # 移除常見的亂碼後綴
+    if '\n作業' in cleaned:
+        cleaned = cleaned.replace('\n作業', '')
+    
+    # 再次清理空白字元
+    cleaned = cleaned.strip()
+    
+    return cleaned
+
 def load_submitted_assignments():
     """讀取已繳交作業記錄"""
     try:
@@ -344,18 +405,31 @@ chrome_options.add_argument("--disable-extensions")  # 禁用擴充功能
 chrome_options.add_argument("--disable-dev-shm-usage")  # 解決資源限制問題
 chrome_options.add_argument("--no-sandbox")  # 加快啟動速度
 chrome_options.add_argument("--disable-blink-features=AutomationControlled")  # 避免被偵測
+# exe優化：減少記憶體使用和加速啟動
+chrome_options.add_argument("--disable-background-timer-throttling")
+chrome_options.add_argument("--disable-backgrounding-occluded-windows")
+chrome_options.add_argument("--disable-renderer-backgrounding")
+chrome_options.add_argument("--disable-features=TranslateUI,VizDisplayCompositor")
+chrome_options.add_argument("--memory-pressure-off")  # 減少記憶體壓力
 chrome_options.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])  # 避免除錯訊息
 chrome_options.page_load_strategy = 'eager'  # 加快頁面載入速度
 
 prefs = {
     "download.default_directory": download_dir,  # 下載到指定資料夾
     "plugins.always_open_pdf_externally": True,  # 避免 PDF 在 Chrome 裡直接開啟
-    "profile.default_content_setting_values.images": 2  # 禁用圖片加快速度
+    "profile.default_content_setting_values.images": 2,  # 禁用圖片加快速度
+    "profile.default_content_setting_values.media_stream": 2,  # 禁用媒體串流
+    "profile.managed_default_content_settings.images": 2,  # 徹底禁用圖片
+    "profile.default_content_settings.popups": 0  # 禁用彈窗
 }
 chrome_options.add_experimental_option("prefs", prefs)
-service = Service(log_path=os.devnull)
-service.creation_flags = subprocess.CREATE_NO_WINDOW
-driver = webdriver.Chrome(options=chrome_options, service=service)
+driver_path = get_chrome_driver_path()
+if driver_path:
+    service = Service(driver_path, log_path=os.devnull)
+    service.creation_flags = subprocess.CREATE_NO_WINDOW
+    driver = webdriver.Chrome(options=chrome_options, service=service)
+else:
+    driver = webdriver.Chrome(options=chrome_options)
 
 def simulate_typing(driver, element_id, text):
     script = f"""
@@ -477,6 +551,26 @@ all_tabs = driver.window_handles
 # 在所有分頁中注入 JavaScript 開始數據提取
 extraction_script = """
 return (function() {
+    // 文本清理函數
+    function cleanActivityName(text) {
+        if (!text) return text;
+        
+        // 移除各種換行字元和不需要的空白字元
+        let cleaned = text.replace(/\\n/g, ' ')
+                          .replace(/\\r/g, ' ')
+                          .replace(/\\t/g, ' ');
+        
+        // 移除多餘的空格
+        cleaned = cleaned.replace(/\\s+/g, ' ').trim();
+        
+        // 移除常見的亂碼後綴
+        if (cleaned.includes('\\n作業')) {
+            cleaned = cleaned.replace('\\n作業', '');
+        }
+        
+        return cleaned.trim();
+    }
+    
     let data = {
         courseName: document.querySelector('h1.h2') ? document.querySelector('h1.h2').textContent : null,
         sections: []
@@ -498,6 +592,9 @@ return (function() {
                 let nameElem = act.querySelector('span.instancename');
                 name = nameElem ? nameElem.textContent.trim() : null;
             }
+            
+            // 清理活動名稱
+            name = cleanActivityName(name);
             
             if (name && !(name.startsWith('第') && name.endsWith('週')) && name.trim()) {
                 let link = act.querySelector('a.aalink');
@@ -646,7 +743,7 @@ def process_extracted_data(tab_handle, data, href):
         week_block.append("-" * 40)
         
         for act_data in section['activities']:
-            name = act_data['name']
+            name = clean_activity_name(act_data['name'])  # 再次確保清理
             href_link = act_data['href']
 
             week_activity_infos.append((name, href_link))
@@ -760,7 +857,8 @@ with ThreadPoolExecutor(max_workers=len(all_tabs)) as executor:
                     # 輸出所有需要顯示的週次
                     course_name_printed = False  # 追蹤課程名稱是否已輸出
                     for week_info in weeks_to_show:
-                        if week_info and week_info[0] != 1:  # 不是第一週
+                        # if week_info and week_info[0] != 1: TODO 排除用team的教授
+                        if week_info:  # 顯示所有週次，包括第一週
                             # week_info = (week_num, course_name, week_header, activities, course_path, week_label)
                             week_label = week_info[5] if len(week_info) > 5 else None
                             
@@ -799,8 +897,10 @@ with ThreadPoolExecutor(max_workers=len(all_tabs)) as executor:
                             
                             # 顯示所有活動（無論新舊）（縮排2格）
                             for name, href_link in week_info[3]:
+                                # 再次確保活動名稱清理，移除換行字元和亂碼
+                                clean_name = clean_activity_name(name)
                                 # 活動名稱維持黃色，網址改為白色（預設）
-                                print(f"  {YELLOW}{name}{RESET} - {href_link}")
+                                print(f"  {YELLOW}{clean_name}{RESET} - {href_link}")
                             print("")
                              
             
@@ -822,7 +922,7 @@ def remove_zone_identifier(filepath):
         # 靜默失敗,不影響主流程
         pass
         
-def wait_for_download(filename, download_path=None, timeout=300, ask_after=3, size_limit_mb=50):
+def wait_for_download(filename, download_path=None, timeout=300, ask_after=20, size_limit_mb=50):
     """
     等待下載完成。若超過 ask_after 秒或檔案超過 size_limit_mb MB，詢問是否繼續。
     
@@ -846,7 +946,6 @@ def wait_for_download(filename, download_path=None, timeout=300, ask_after=3, si
     if os.path.exists(file_path):
         initial_mtime = os.path.getmtime(file_path)
 
-    print(f"⏳ 等待下載：{filename}")
 
     while True:
         # 檔案存在且無 .crdownload → 檢查是否為新下載的檔案
@@ -868,8 +967,8 @@ def wait_for_download(filename, download_path=None, timeout=300, ask_after=3, si
 
         elapsed = time.time() - start
 
-        # 每 3 秒顯示一次進度
-        if elapsed - last_progress_time >= 3 and elapsed >= 3:
+        # 每 10 秒顯示一次進度
+        if elapsed - last_progress_time >= 10 and elapsed >= 10:
             print(f"   已等待 {int(elapsed)} 秒…")
             last_progress_time = elapsed
 
@@ -1065,7 +1164,7 @@ if red_activities_to_print:
     # 如果是第一次使用，跳過這些輸出和下載
     if not IS_FIRST_TIME:
         print("\n" + "="*60)
-        print(f"{PINK}🔻 以下為新增活動{RESET}")
+        print(f"{RED}🔻 以下為新增活動{RESET}")
         print("="*60 + "\n")
     
     total_downloaded_files = 0  # 追蹤總下載檔案數
@@ -1083,14 +1182,30 @@ if red_activities_to_print:
         # 如果這個課程已被標記為跳過，則跳過
         if course_name in skipped_courses:
             continue
+        
+        # 如果是 URL 類型活動，先獲取實際的外部連結用於顯示
+        display_link = link
+        if "mod/url/view.php" in link:
+            try:
+                driver.get(link)
+                time.sleep(0.2)
+                url_links = driver.find_elements(By.CSS_SELECTOR, "div.urlworkaround a[href]")
+                if url_links:
+                    for url_link in url_links:
+                        actual_url = url_link.get_attribute("href")
+                        if actual_url and not actual_url.startswith("https://elearningv4.nuk.edu.tw"):
+                            display_link = actual_url
+                            break
+            except:
+                pass
             
         # 如果是第一次使用，跳過詳細輸出
         if not IS_FIRST_TIME:
-            print(f"\n{RED}━━━ {name} ━━━{RESET}")
-            print(f"{PINK}課程：{course_name}{RESET}")
-            print(f"週次：{week_header}")
-            print(f"活動連結：{link}")
-            print(f"儲存位置：{course_path}\n")
+            print(f"\n{YELLOW}━━━{RESET} {RED}{name}{RESET} {YELLOW}━━━{RESET}")
+            print(f"{PINK}課程：{RESET}{LOWGREEN}{course_name}{RESET}")
+            print(f"{PINK}週次：{RESET}{week_header}")
+            print(f"{PINK}活動連結：{RESET}{ITALIC}{display_link}{RESET}")
+            print(f"{PINK}儲存位置：{RESET}{ITALIC}{course_path}{RESET}\n")
         
         # 確保每次都重新設定下載路徑到正確的課程資料夾（用於資料夾/作業的 Selenium 下載）
         driver.execute_cdp_cmd("Page.setDownloadBehavior", {
@@ -1113,31 +1228,27 @@ if red_activities_to_print:
                     act_name = act.get_attribute("data-activityname")
                     if not act_name:
                         try:
-                            act_name = act.find_element(By.CSS_SELECTOR, "span.instancename").text.strip()
+                            act_name = clean_activity_name(act.find_element(By.CSS_SELECTOR, "span.instancename").text)
                         except:
                             continue
                     
                     if act_name == name:
-                        # 找到對應的活動,檢查是否有圖片
+                        # 找到對應的活動，檢查是否有圖片或連結
                         try:
-                            images = act.find_elements(By.CSS_SELECTOR, "img[src*='pluginfile.php']")
-                            for img in images:
-                                img_url = img.get_attribute("src")
+                            session = create_session_with_cookies()
+                            
+                            # 優先抓取 a[href*='pluginfile.php']（含圖片連結，href是原圖）
+                            anchors = act.find_elements(By.CSS_SELECTOR, "a[href*='pluginfile.php']")
+                            for anchor in anchors:
+                                img_url = anchor.get_attribute("href")
                                 filename = extract_filename_from_url(img_url)
-                                
-                                # 使用 requests 直接下載圖片（覆蓋同名檔案）
                                 try:
-                                    # 使用 session 以保持登入狀態
-                                    session = create_session_with_cookies()
-                                    
-                                    # 下載圖片
                                     response = session.get(img_url, stream=True)
                                     if response.status_code == 200:
                                         file_path = os.path.join(course_path, filename)
                                         with open(file_path, 'wb') as f:
                                             for chunk in response.iter_content(chunk_size=8192):
                                                 f.write(chunk)
-
                                         files_to_unblock.append(file_path)
                                         downloaded_files.add(filename)
                                         existing_files.add(filename)
@@ -1146,6 +1257,43 @@ if red_activities_to_print:
                                         print(f"{RED}❌ 下載失敗: HTTP {response.status_code}{RESET}")
                                 except Exception as e:
                                     print(f"{RED}❌ 下載失敗: {e}{RESET}")
+                            
+                            # 若無帶連結的圖片，退而抓取 img[src] 縮圖
+                            if not anchors:
+                                images = act.find_elements(By.CSS_SELECTOR, "img[src*='pluginfile.php']")
+                                for img in images:
+                                    img_url = img.get_attribute("src")
+                                    filename = extract_filename_from_url(img_url)
+                                    try:
+                                        response = session.get(img_url, stream=True)
+                                        if response.status_code == 200:
+                                            file_path = os.path.join(course_path, filename)
+                                            with open(file_path, 'wb') as f:
+                                                for chunk in response.iter_content(chunk_size=8192):
+                                                    f.write(chunk)
+                                            files_to_unblock.append(file_path)
+                                            downloaded_files.add(filename)
+                                            existing_files.add(filename)
+                                            total_downloaded_files += 1
+                                        else:
+                                            print(f"{RED}❌ 下載失敗: HTTP {response.status_code}{RESET}")
+                                    except Exception as e:
+                                        print(f"{RED}❌ 下載失敗: {e}{RESET}")
+                            
+                            # 同時抓取外部連結（非 pluginfile.php 的 a[href]），存為捷徑
+                            ext_anchors = act.find_elements(By.CSS_SELECTOR, "a[href]")
+                            for anchor in ext_anchors:
+                                href = anchor.get_attribute("href")
+                                if href and "pluginfile.php" not in href and not href.startswith("https://elearningv4.nuk.edu.tw"):
+                                    safe_filename = "".join(c if c.isalnum() or c in " _-()（）" else "_" for c in name)
+                                    safe_filename = safe_filename[:100]
+                                    url_file = os.path.join(course_path, f"{safe_filename}.url")
+                                    with open(url_file, 'w', encoding='utf-8') as f:
+                                        f.write(f"[InternetShortcut]\n")
+                                        f.write(f"URL={href}\n")
+                                    total_downloaded_files += 1
+                                    print(f"🔗 {BLUE}連結: {href}{RESET}")
+                                    
                         except Exception as e:
                             print(f"⚠️ 無法下載圖片: {e}")
                         break
@@ -1351,7 +1499,7 @@ if red_activities_to_print:
                 driver.get(link)
                 wait = WebDriverWait(driver, 5)
                 
-                print(f"📂 進入資料夾/作業頁面...")
+  
                 
                 # 首先檢查當前頁面是否是作業頁面,並下載作業說明的附件
                 if "mod/assign/view.php" in link:
@@ -1362,13 +1510,12 @@ if red_activities_to_print:
                         filename = extract_filename_from_url(intro_href)
                         
                         try:
-                            print(f"📄 下載作業說明附件: {filename}")
+
                             intro_link.click()
                             wait = WebDriverWait(driver, 5)
                             file_path = wait_for_download(filename, download_path=course_path)
                             if file_path == 'SKIP_COURSE':
                                 skipped_courses.add(course_name)
-                                print(f"{YELLOW}⏭️ 跳過課程 {course_name} 的所有剩餘檔案{RESET}")
                                 break
                             if file_path:
                                 files_to_unblock.append(file_path)
@@ -1384,6 +1531,39 @@ if red_activities_to_print:
                                 'url': intro_href,
                                 'filename': filename
                             })
+                    
+                    # 提取作業說明中嵌入的影片連結（例如 YouTube VideoJS）
+                    try:
+                        import json as _json
+                        video_elems = driver.find_elements(By.CSS_SELECTOR, "div.activity-description [data-setup-lazy]")
+                        saved_video_urls = set()
+                        for velem in video_elems:
+                            setup_raw = velem.get_attribute("data-setup-lazy")
+                            if not setup_raw:
+                                continue
+                            try:
+                                setup_data = _json.loads(setup_raw)
+                                sources = setup_data.get("sources", [])
+                                for src_item in sources:
+                                    src_url = src_item.get("src", "")
+                                    # HTML 中有時 & 被編碼為 &amp;，需還原
+                                    src_url = src_url.replace("&amp;", "&")
+                                    if src_url and src_url not in saved_video_urls:
+                                        saved_video_urls.add(src_url)
+                                        # 產生安全檔名
+                                        safe_vname = "".join(c if c.isalnum() or c in " _-()（）" else "_" for c in name)
+                                        safe_vname = safe_vname[:80]
+                                        # 若有多段影片加序號區別
+                                        vindex = len(saved_video_urls)
+                                        suffix = f"_影片{vindex}" if vindex > 1 else "_影片"
+                                        url_file = os.path.join(course_path, f"{safe_vname}{suffix}.url")
+                                        with open(url_file, 'w', encoding='utf-8') as uf:
+                                            uf.write(f"[InternetShortcut]\nURL={src_url}\n")
+                                        total_downloaded_files += 1
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        print(f"⚠️ 無法提取影片連結: {e}")
                 
                 # 找出 submission 區塊內的所有連結（要排除 - 這是已提交的作業）
                 submission_links = set()
@@ -1422,13 +1602,12 @@ if red_activities_to_print:
                 for intro_link in intro_attachments:
                     file_href_set.add(intro_link.get_attribute("href"))
                 
-                print(f"   總共收集到 {len(file_href_set)} 個唯一檔案連結")
                 
                 # 處理收集到的檔案連結
                 for f_href in file_href_set:
                     filename = extract_filename_from_url(f_href)
                     try:
-                        print(f"🔽 下載檔案: {filename}")
+
                         
                         # 使用 session 直接下載
                         session = create_session_with_cookies()
@@ -1472,8 +1651,6 @@ if red_activities_to_print:
                             actual_url = url_link.get_attribute("href")
                             link_text = url_link.text
                             if actual_url and not actual_url.startswith("https://elearningv4.nuk.edu.tw"):
-                                print(f"{BLUE}📎 找到外部連結: {link_text}{RESET}")
-                                print(f"   {actual_url}")
                                 
                                 # 清理檔案名稱，移除不合法字元
                                 safe_filename = "".join(c if c.isalnum() or c in " _-()（）" else "_" for c in name)
@@ -1512,34 +1689,28 @@ if red_activities_to_print:
                                                 existing_files.add(os.path.basename(excel_file))
                                             else:
                                                 print(f"{YELLOW}⚠️ 無法下載 Google Sheets (可能需要權限){RESET}")
-                                                # 仍然儲存連結
-                                                url_file = os.path.join(course_path, f"{safe_filename}_連結.txt")
+                                                # 儲存為 Windows 捷徑
+                                                url_file = os.path.join(course_path, f"{safe_filename}.url")
                                                 with open(url_file, 'w', encoding='utf-8') as f:
-                                                    f.write(f"{name}\n")
-                                                    f.write(f"連結: {actual_url}\n")
-                                                    f.write(f"說明: {link_text}\n")
-                                                print(f"{GREEN}✅ 已儲存連結到: {os.path.basename(url_file)}{RESET}")
+                                                    f.write(f"[InternetShortcut]\n")
+                                                    f.write(f"URL={actual_url}\n")
                                                 total_downloaded_files += 1
                                         else:
                                             print(f"{YELLOW}⚠️ 無法解析 Google Sheets ID{RESET}")
                                     except Exception as e:
                                         print(f"{RED}❌ 下載 Google Sheets 失敗: {e}{RESET}")
-                                        # 發生錯誤時仍儲存連結
-                                        url_file = os.path.join(course_path, f"{safe_filename}_連結.txt")
+                                        # 儲存為 Windows 捷徑
+                                        url_file = os.path.join(course_path, f"{safe_filename}.url")
                                         with open(url_file, 'w', encoding='utf-8') as f:
-                                            f.write(f"{name}\n")
-                                            f.write(f"連結: {actual_url}\n")
-                                            f.write(f"說明: {link_text}\n")
-                                        print(f"{GREEN}✅ 已儲存連結到: {os.path.basename(url_file)}{RESET}")
+                                            f.write(f"[InternetShortcut]\n")
+                                            f.write(f"URL={actual_url}\n")
                                         total_downloaded_files += 1
                                 else:
-                                    # 一般連結，儲存為文字檔
-                                    url_file = os.path.join(course_path, f"{safe_filename}_連結.txt")
+                                    # 一般連結，儲存為 Windows 捷徑（可直接點擊開啟）
+                                    url_file = os.path.join(course_path, f"{safe_filename}.url")
                                     with open(url_file, 'w', encoding='utf-8') as f:
-                                        f.write(f"{name}\n")
-                                        f.write(f"連結: {actual_url}\n")
-                                        f.write(f"說明: {link_text}\n")
-                                    print(f"{GREEN}✅ 已儲存連結到: {os.path.basename(url_file)}{RESET}")
+                                        f.write(f"[InternetShortcut]\n")
+                                        f.write(f"URL={actual_url}\n")
                                     total_downloaded_files += 1
                     else:
                         print(f"{YELLOW}⚠️ 未找到外部連結{RESET}")
@@ -1575,8 +1746,7 @@ if red_activities_to_print:
                             f.write(f"{name}\n")
                             f.write("=" * 60 + "\n\n")
                             f.write(description_text)
-                        
-                        print(f"{GREEN}✅ 已儲存討論區內容到: {os.path.basename(txt_file)}{RESET}")
+                    
                         total_downloaded_files += 1
                         existing_files.add(os.path.basename(txt_file))
                     else:
@@ -1587,7 +1757,7 @@ if red_activities_to_print:
                 continue
             
             # Case 5: 其他類型的活動 (如 page 等) - 無需下載
-            print(f"ℹ️ 此活動類型無需下載檔案")
+
             
         except Exception as e:
             print(f"{RED}❌ 處理活動時發生錯誤: {e}{RESET}")
@@ -1616,7 +1786,7 @@ if failed_downloads and not IS_FIRST_TIME:
         print(f"\n📌 {item['name']}")
         print(f"   課程: {item['course']}")
         print(f"   檔名: {item['filename']}")
-        print(f"   {BLUE}🔗 下載連結: {item['url']}{RESET}")
+        print(f"   {BLUE}下載連結: {item['url']}{RESET}")
 
 extracted_count = 0
 failed_extract = []  # 記錄解壓失敗的檔案
@@ -1686,9 +1856,7 @@ def check_assignments_background():
             for link_elem in assign_links:
                 try:
                     act_href = link_elem.get_attribute("href")
-                    act_name = link_elem.find_element(By.CSS_SELECTOR, "span.instancename").text.strip()
-                    if '\n作業' in act_name:
-                        act_name = act_name.replace('\n作業', '').strip()
+                    act_name = clean_activity_name(link_elem.find_element(By.CSS_SELECTOR, "span.instancename").text)
                     if act_href and act_name:
                         assignments_info.append({'href': act_href, 'name': act_name})
                 except:
@@ -1768,10 +1936,10 @@ def check_assignments_background():
             driver.switch_to.window(tab_handle)
             continue
     
-    # 更新已繳交作業記錄
+    # 更新已繳交作業記錄（無論有無新增，都儲存以確保檔案存在）
     if newly_submitted:
         submitted_assignments.update(newly_submitted)
-        save_submitted_assignments(submitted_assignments)
+    save_submitted_assignments(submitted_assignments)
     
     assignment_check_completed = True
 
@@ -1786,7 +1954,7 @@ assignment_check_thread.start()
 if IS_FIRST_TIME:
     print(f"\n{GREEN}環境建置完成{RESET}")
     print(f"\n{YELLOW}可在下次上課前再次執行此程式{RESET}")
-    
+    a=input()
     # 程式結束前關閉所有分頁（在背景線程中執行避免卡頓）
     def cleanup_driver():
         try:
@@ -1798,7 +1966,7 @@ if IS_FIRST_TIME:
     cleanup_thread.start()
     sys.exit(0)
 
-print(f"{PINK}開啟以下課程的資料夾：{RESET}")
+print(f"{PINK}開啟以下課程的資料夾：{RESET}\n")
 
 
 # 收集所有課程資料夾（直接使用已有的 course_results 數據）
@@ -1816,7 +1984,7 @@ for name, link, course_name, week_header, course_path, course_url in red_activit
 ibxx=0
 for idx, (course_name, course_path) in enumerate(all_courses.items(), 1):
     if course_name in red_course_names:
-        print(f"  {RED}{idx}. {course_name} (NEW){RESET}")
+        print(f"  {RED}{idx}. {course_name}{RESET}")
     else:
         if ibxx%2==0:
             print(f"  {MIKU}{idx}. {course_name}{RESET}")
@@ -1824,6 +1992,11 @@ for idx, (course_name, course_path) in enumerate(all_courses.items(), 1):
             print(f"  {BBLUE}{idx}. {course_name}{RESET}")
     ibxx += 1
 choice = input(f"\n{PINK}請輸入編號（或輸入 'u' 繳交作業，可用空白分隔多個編號）: {RESET}").strip().lower()
+
+# 如果直接按 Enter（空輸入），立即結束程式
+if not choice:
+    # 最快速結束，跳過所有清理操作
+    os._exit(0)
 
 # 支援空白分隔多個編號
 choice_parts = choice.split()
@@ -1851,6 +2024,10 @@ if choice == 'u':
         # 詢問要開啟哪些作業
         selection = input(f"{PINK}請輸入要開啟的作業編號（可個用空白分隔): {RESET}").strip().lower()
         
+        # 按 Enter 直接結束（thread 已在 join 後儲存 submitted_assignments）
+        if not selection:
+            os._exit(0)
+        
         selected_assignments = []
         if selection == 'a':
             selected_assignments = empty_assignments
@@ -1868,7 +2045,12 @@ if choice == 'u':
             chrome_options_visible = Options()
             chrome_options_visible.add_argument("--log-level=3")
             chrome_options_visible.add_experimental_option("excludeSwitches", ["enable-logging"])
-            driver = webdriver.Chrome(options=chrome_options_visible)
+            visible_driver_path = get_chrome_driver_path()
+            if visible_driver_path:
+                visible_service = Service(visible_driver_path)
+                driver = webdriver.Chrome(options=chrome_options_visible, service=visible_service)
+            else:
+                driver = webdriver.Chrome(options=chrome_options_visible)
             
             # 重新登入 (與第一次登入完全相同的流程，最多嘗試2次)
             login_success = False
@@ -1954,7 +2136,9 @@ if choice == 'u':
     
     # 如果選擇 'u' 但沒有未繳交作業，繼續執行下面的程式碼
     else:
-        print(f"\n{GREEN}✅ 太棒了！所有作業都已繳交！{RESET}")
+        print(f"\n{GREEN}所有作業都已繳交{RESET}")
+        # 沒有作業需要處理，直接結束程式
+        os._exit(0)
 
 elif choice_parts and all(token.isdigit() for token in choice_parts):
     opened = 0
@@ -1967,12 +2151,44 @@ elif choice_parts and all(token.isdigit() for token in choice_parts):
             opened += 1
     if opened == 0:
         print("輸入無效，未開啟任何資料夾")
+    # 開啟資料夾後立即結束
+    os._exit(0)
 
-# 程式結束前關閉所有分頁（在背景線程中執行避免卡頓）
+# 程式結束前完整清理資源（優化 exe 執行效能）
+def cleanup_resources():
+    """完整清理所有資源，避免 exe 卡頓"""
+    try:
+        # 快速關閉 WebDriver，避免網路通信延遲
+        if 'driver' in globals() and driver:
+            # 使用更快速的關閉方式，避免atexit時的網路超時
+            try:
+                driver.service.stop()  # 直接停止服務
+            except:
+                pass
+            try:
+                driver.quit()
+            except:
+                pass
+    except Exception:
+        pass
+    
+    try:
+        # 強制垃圾回收
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+
+# 註冊程式退出時的清理函數（僅在非強制退出時執行）
+import atexit
+atexit.register(cleanup_resources)
+
+# 額外保險：背景線程清理（保留原有邏輯）
 def cleanup_driver():
     try:
-        driver.quit()
-    except:
+        if 'driver' in globals() and driver:
+            driver.quit()
+    except Exception:
         pass
 
 cleanup_thread = threading.Thread(target=cleanup_driver, daemon=True)
