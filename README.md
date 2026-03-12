@@ -22,4 +22,10 @@
 - 找到程式碼當中TODO的部分，自行修改password的讀取位置及讀取方式(可用AI)
 - 若遇到問題(檔案下載出現錯誤,執行被中斷等)可以直接修改並PR
 - 也可以和我一樣匯出exe，就不要每次還需要開vscode
-### 使用說明 [https://hackmd.io/wJQ18WJPRYO5IXklfe0_GQ](https://hackmd.io/@richen/SkASnFgB-x)
+### 注意事項:
+- 按Enter(輸入環節)或Ctrl+C(執行中)能快速結束程式
+- 看到以下輸出非程式錯誤，不必理會
+    - Created TensorFlow Lite XNNPACK delegate for CPU
+    - DevTools listening on ws://127.0.0.1
+    - GetGpuDriverOverlayInfo: Failed to retrieve video device
+### 程式說明: [https://hackmd.io/wJQ18WJPRYO5IXklfe0_GQ](https://hackmd.io/@richen/SkASnFgB-x)
