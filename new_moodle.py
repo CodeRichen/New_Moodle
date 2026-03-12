@@ -84,15 +84,30 @@ try:
 except ImportError:
     HAS_RARFILE = False
 
-# 偵測終端是否支援 ANSI 顏色
+# 偵測終端是否支援 ANSI 顏色，並在 Windows 上主動啟用 VT 模式
 import sys as _sys
 def _supports_color():
     if os.environ.get("NO_COLOR"):   # https://no-color.org/ 明確要求關閉
         return False
-    # Windows 10 v1511+ (build 10586) 的 Console Host 原生支援 ANSI
-    # PowerShell、Windows Terminal、VS Code terminal 皆支援
-    # 直接開啟，讓使用者透過 NO_COLOR 關閉即可
-    return True
+    if os.name == 'nt':
+        # Win10 v1511+ 原生支援，但需透過 SetConsoleMode 明確啟用
+        # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        try:
+            import ctypes, ctypes.wintypes
+            kernel32 = ctypes.windll.kernel32
+            hOut = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+            mode = ctypes.wintypes.DWORD()
+            if kernel32.GetConsoleMode(hOut, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(hOut, mode.value | 0x0004)
+                return True  # 成功啟用 VT mode
+        except Exception:
+            pass
+        # fallback：VS Code terminal / ConPTY / Windows Terminal 等偽 tty 也支援
+        if os.environ.get("TERM_PROGRAM") or os.environ.get("WT_SESSION") or os.environ.get("COLORTERM"):
+            return True
+        return False  # 真的不支援（舊版 cmd.exe、無色彩環境）
+    # macOS / Linux：只要 stdout 是 tty 就支援
+    return hasattr(_sys.stdout, 'isatty') and _sys.stdout.isatty()
 
 _USE_COLOR = _supports_color()
 
@@ -126,6 +141,38 @@ PASSWORD_FILE = os.path.join(BASE_DOWNLOAD_DIR, "password.txt")
 
 # 確保主目錄存在
 os.makedirs(BASE_DOWNLOAD_DIR, exist_ok=True)
+
+# ========== 全域錯誤捕捉：出錯時輸出至 error_log.txt ==========
+import traceback as _traceback
+_ERROR_LOG = os.path.join(BASE_DOWNLOAD_DIR, "error_log.txt")
+
+def _write_error_log(exc_type, exc_value, exc_tb, *, source="主執行緒"):
+    import datetime
+    try:
+        with open(_ERROR_LOG, 'a', encoding='utf-8') as _f:
+            _f.write(f"\n{'='*60}\n")
+            _f.write(f"時間：{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            _f.write(f"來源：{source}\n")
+            _f.write(_traceback.format_exc() if exc_tb is None
+                     else ''.join(_traceback.format_exception(exc_type, exc_value, exc_tb)))
+            _f.write(f"{'='*60}\n")
+    except Exception:
+        pass
+
+def _global_excepthook(exc_type, exc_value, exc_tb):
+    _write_error_log(exc_type, exc_value, exc_tb)
+    print(f"\n\033[31m❌ 程式發生未預期錯誤，詳情已儲存至：\n   {_ERROR_LOG}\033[0m")
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+sys.excepthook = _global_excepthook
+
+def _thread_excepthook(args):
+    _write_error_log(args.exc_type, args.exc_value, args.exc_traceback,
+                     source=f"背景執行緒 {getattr(args.thread, 'name', '?')}")
+
+import threading as _threading_err
+_threading_err.excepthook = _thread_excepthook
+# ================================================================
 
 # 初始化第一次使用標記
 IS_FIRST_TIME = False
