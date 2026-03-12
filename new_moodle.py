@@ -1,4 +1,4 @@
-# pip install selenium webdriver-manager colorama requests py7zr patool rarfile
+# pip install selenium webdriver-manager colorama requests py7zr patool rarfile gdown
 # 不要在開啟Moodle網頁的狀態執行程式
 
 import os
@@ -84,18 +84,34 @@ try:
 except ImportError:
     HAS_RARFILE = False
 
-YELLOW = "\033[33m"
-RED = "\033[38;2;255;105;180m"
-BLUE = "\033[34m"
-BBLUE = "\033[94m"
-ITALIC = "\033[3;37m"
-MIKU = "\033[36m"
-LOWGREEN = "\033[32m"
-GREEN = "\033[38;2;055;205;180m"
-PURPLE = "\033[38;5;129m"  # 亮紫紅色
-ORANGE = "\033[38;5;214m"  # 黃橘色
-RESET = "\033[0m"
-PINK = "\033[38;2;255;220;255m"
+# 偵測終端是否支援 ANSI 顏色
+import sys as _sys
+def _supports_color():
+    if os.environ.get("NO_COLOR"):   # https://no-color.org/ 明確要求關閉
+        return False
+    # Windows 10 v1511+ (build 10586) 的 Console Host 原生支援 ANSI
+    # PowerShell、Windows Terminal、VS Code terminal 皆支援
+    # 直接開啟，讓使用者透過 NO_COLOR 關閉即可
+    return True
+
+_USE_COLOR = _supports_color()
+
+if _USE_COLOR:
+    YELLOW   = "\033[33m"
+    RED      = "\033[38;2;255;105;180m"
+    BLUE     = "\033[34m"
+    BBLUE    = "\033[94m"
+    ITALIC   = "\033[3;37m"
+    MIKU     = "\033[36m"
+    LOWGREEN = "\033[32m"
+    GREEN    = "\033[38;2;055;205;180m"
+    PURPLE   = "\033[38;5;129m"
+    ORANGE   = "\033[38;5;214m"
+    RESET    = "\033[0m"
+    PINK     = "\033[38;2;255;220;255m"
+else:
+    YELLOW = RED = BLUE = BBLUE = ITALIC = MIKU = ""
+    LOWGREEN = GREEN = PURPLE = ORANGE = RESET = PINK = ""
 
 # ========== TODO 路徑設定區域（修改這裡可以改變所有檔案存放位置）==========
 # 主要下載目錄 - 修改這裡就能改變所有檔案的存放位置
@@ -857,8 +873,8 @@ with ThreadPoolExecutor(max_workers=len(all_tabs)) as executor:
                     # 輸出所有需要顯示的週次
                     course_name_printed = False  # 追蹤課程名稱是否已輸出
                     for week_info in weeks_to_show:
-                        # if week_info and week_info[0] != 1: TODO 排除用team的教授
-                        if week_info:  # 顯示所有週次，包括第一週
+                        if week_info and week_info[0] != 1: #TODO 排除用team的教授
+                        # if week_info:  # 顯示所有週次，包括第一週
                             # week_info = (week_num, course_name, week_header, activities, course_path, week_label)
                             week_label = week_info[5] if len(week_info) > 5 else None
                             
@@ -933,6 +949,10 @@ def wait_for_download(filename, download_path=None, timeout=300, ask_after=20, s
     """
     if download_path is None:
         download_path = download_dir
+    # 第一次建置：30 秒自動跳過，不詢問
+    if IS_FIRST_TIME:
+        ask_after = 30
+        timeout = 30
     file_path = os.path.join(download_path, filename)
     cr_path = file_path + ".crdownload"
     start = time.time()
@@ -957,52 +977,52 @@ def wait_for_download(filename, download_path=None, timeout=300, ask_after=20, s
                     # 檔案沒有更新,繼續等待
                     time.sleep(0.2)
                     elapsed = time.time() - start
-                    if elapsed > 10:  # 等待超過10秒還沒新檔案,可能下載到其他地方
-                        print(f"{RED}⚠️ 未偵測到新下載的檔案,可能已存在舊檔案{RESET}")
+                    if elapsed > 5:  # 等待超過5秒還沒新檔案,可能下載到其他地方
                         return None
                     continue
-            
-            # print(f"{GREEN}✅ 下載完成：{filename}{RESET}")
+
             return file_path
 
         elapsed = time.time() - start
 
         # 每 10 秒顯示一次進度
-        if elapsed - last_progress_time >= 10 and elapsed >= 10:
-            print(f"   已等待 {int(elapsed)} 秒…")
+        if not IS_FIRST_TIME and elapsed - last_progress_time >= 10 and elapsed >= 10:
+            print(f"已等待 {int(elapsed)} 秒")
             last_progress_time = elapsed
 
-        # 超過指定等待秒數 → 問是否繼續等
+        # 超過指定等待秒數
         if elapsed > ask_after and not 已詢問時間:
-            print(f"\n{YELLOW}⚠️ 下載已等待超過 {ask_after} 秒{RESET}")
+            已詢問時間 = True
+            if IS_FIRST_TIME:
+                # 第一次建置：自動跳過，不詢問
+                return None
+            print(f"\n{YELLOW}下載已等待超過 {ask_after} 秒{RESET}")
             print(f"   檔案：{filename}")
             print(f"   - 繼續等待 (Enter)")
             print(f"   - 放棄此檔案 (輸入 d)")
             print(f"   - 放棄此課程所有檔案 (輸入 dd)")
             choice = input(f"   請選擇：").strip().lower()
-            已詢問時間 = True
-            last_progress_time = elapsed  # 重置進度時間，避免詢問後立即輸出進度
+            last_progress_time = elapsed
             if choice == "dd":
-                print(f"{YELLOW}⏭️ 已放棄此課程所有檔案下載{RESET}\n")
                 return 'SKIP_COURSE'
             elif choice == "d":
-                print(f"{YELLOW}⏭️ 已放棄此檔案下載{RESET}\n")
                 return None
-            print(f"   繼續等待下載...\n")
-
-        # 若部分下載的檔案存在 → 檢查大小
+        # 若部分下載的檔案存在 → 第一次建置不詢問，直接跳過大檔案
         if os.path.exists(file_path) and not 已詢問大小:
             size_mb = os.path.getsize(file_path) / (1024 * 1024)
             if size_mb > size_limit_mb:
-                choice = input(f"⚠️ 檔案超過 {size_limit_mb} MB，要繼續下載嗎？(y/n)：").strip().lower()
                 已詢問大小 = True
+                if IS_FIRST_TIME:
+                    return None
+                choice = input(f"檔案超過 {size_limit_mb} MB，要繼續下載嗎？(y/n)：").strip().lower()
                 if choice != "y":
                     print("⏭️ 使用者選擇跳過。")
                     return None
 
         # 檢查是否超過 timeout
         if elapsed > timeout:
-            print(f"{RED}❌ 下載超時：{filename}{RESET}")
+            if not IS_FIRST_TIME:
+                print(f"{RED}❌ 下載超時：{filename}{RESET}")
             raise TimeoutError(f"下載超時：{filename}")
 
         time.sleep(0.2)
@@ -1145,8 +1165,99 @@ def create_session_with_cookies():
         session.cookies.set(cookie['name'], cookie['value'])
     return session
 
+def try_download_google_drive(gdrive_url, dest_dir, base_name, session):
+    """
+    gdown for Drive files/folders, requests export for Docs/Sheets/Slides.
+    Returns downloaded file/folder path, or None on failure.
+    """
+    import re as _re
+    import gdown
+    url = gdrive_url
+
+    # --- Google Drive folder ---
+    m_folder = _re.search(r'drive\.google\.com/drive/(?:u/\d+/)?folders/([a-zA-Z0-9_-]+)', url)
+    if m_folder:
+        fid = m_folder.group(1)
+        folder_url = f"https://drive.google.com/drive/folders/{fid}"
+        try:
+            result = gdown.download_folder(folder_url, output=dest_dir, quiet=True, use_cookies=False)
+            if result:
+                return dest_dir
+        except Exception:
+            pass
+        return None
+
+    # --- Google Drive single file ---
+    m = _re.search(r'drive\.google\.com/(?:file/d/|open\?id=)([a-zA-Z0-9_-]+)', url)
+    if not m:
+        m = _re.search(r'[?&]id=([a-zA-Z0-9_-]+)', url)
+    if m:
+        fid = m.group(1)
+        file_url = f"https://drive.google.com/uc?id={fid}"
+        try:
+            out_path = gdown.download(file_url, output=dest_dir + "/", quiet=True, use_cookies=False, fuzzy=True)
+            if out_path and os.path.exists(out_path):
+                return out_path
+        except Exception:
+            pass
+        return None
+
+    def _save_stream(rsp, filepath):
+        if rsp.status_code != 200:
+            return False
+        for chunk in rsp.iter_content(chunk_size=8192):
+            pass  # consume to detect HTML error pages in first chunk
+        rsp2 = session.get(rsp.url, stream=True, allow_redirects=True, timeout=30)
+        if rsp2.status_code != 200:
+            return False
+        with open(filepath, 'wb') as f:
+            for chunk in rsp2.iter_content(chunk_size=8192):
+                f.write(chunk)
+        return os.path.getsize(filepath) > 0
+
+    def _export_stream(export_url, filepath):
+        try:
+            rsp = session.get(export_url, stream=True, allow_redirects=True, timeout=60)
+            if rsp.status_code != 200:
+                return False
+            with open(filepath, 'wb') as f:
+                for chunk in rsp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            return os.path.getsize(filepath) > 0
+        except Exception:
+            return False
+
+    # --- Google Sheets ---
+    m = _re.search(r'spreadsheets/d/([a-zA-Z0-9_-]+)', url)
+    if m:
+        sid = m.group(1)
+        fp = os.path.join(dest_dir, f"{base_name}.xlsx")
+        if _export_stream(f"https://docs.google.com/spreadsheets/d/{sid}/export?format=xlsx", fp):
+            return fp
+        return None
+
+    # --- Google Docs ---
+    m = _re.search(r'document/d/([a-zA-Z0-9_-]+)', url)
+    if m:
+        did = m.group(1)
+        fp = os.path.join(dest_dir, f"{base_name}.docx")
+        if _export_stream(f"https://docs.google.com/document/d/{did}/export?format=docx", fp):
+            return fp
+        return None
+
+    # --- Google Slides ---
+    m = _re.search(r'presentation/d/([a-zA-Z0-9_-]+)', url)
+    if m:
+        pid = m.group(1)
+        fp = os.path.join(dest_dir, f"{base_name}.pptx")
+        if _export_stream(f"https://docs.google.com/presentation/d/{pid}/export?format=pptx", fp):
+            return fp
+        return None
+
+    return None
+
     # 🔴 先自動開啟所有紅色課程的資料夾
-if red_activities_to_print:
+if red_activities_to_print and not IS_FIRST_TIME:
    
 
     
@@ -1292,7 +1403,6 @@ if red_activities_to_print:
                                         f.write(f"[InternetShortcut]\n")
                                         f.write(f"URL={href}\n")
                                     total_downloaded_files += 1
-                                    print(f"🔗 {BLUE}連結: {href}{RESET}")
                                     
                         except Exception as e:
                             print(f"⚠️ 無法下載圖片: {e}")
@@ -1316,6 +1426,27 @@ if red_activities_to_print:
                     
                     driver.get(link)
                     wait = WebDriverWait(driver, 5)
+                    
+                    # 偵測重導向：Moodle 有時直接把瀏覽器導向 pluginfile.php
+                    if 'pluginfile.php' in driver.current_url:
+                        redirect_url = driver.current_url
+                        redirect_filename = extract_filename_from_url(redirect_url)
+                        if redirect_filename and not redirect_filename.lower().endswith(('.htm', '.html')):
+                            try:
+                                session = create_session_with_cookies()
+                                rsp = session.get(redirect_url, stream=True)
+                                if rsp.status_code == 200:
+                                    fp = os.path.join(course_path, redirect_filename)
+                                    with open(fp, 'wb') as f:
+                                        for chunk in rsp.iter_content(chunk_size=8192):
+                                            f.write(chunk)
+                                    files_to_unblock.append(fp)
+                                    downloaded_files.add(redirect_filename)
+                                    existing_files.add(redirect_filename)
+                                    total_downloaded_files += 1
+                            except Exception:
+                                pass
+                            continue
                     
                     # 在資源頁面中找到實際的下載連結（只抓主要內容區的連結）
                     download_links = driver.find_elements(By.CSS_SELECTOR, "div.resourceworkaround a[href*='pluginfile.php']")
@@ -1375,7 +1506,6 @@ if red_activities_to_print:
                                     success = extract_file(file_path, course_path)
                                     if success:
                                         os.remove(file_path)
-                                        print(f"   ✅ 解壓完成並刪除原始檔")
                                     else:
                                         print(f"   {YELLOW}⚠️ 解壓失敗，保留原始檔{RESET}")
                         
@@ -1417,7 +1547,32 @@ if red_activities_to_print:
                                                 # print(f"   {GREEN}✅ 解壓完成並刪除原始檔{RESET}")
                             continue
                         
-                        # print(f"{YELLOW}⚠️  此資源頁面沒有附件，跳過{RESET}")
+                        # 後備：掃描頁面內嵌的 pluginfile.php 資源（圖片/PDF inline 顯示時）
+                        try:
+                            inline_elems = driver.find_elements(By.CSS_SELECTOR,
+                                "img[src*='pluginfile.php'], object[data*='pluginfile.php'], embed[src*='pluginfile.php'], a[href*='pluginfile.php']")
+                            session = create_session_with_cookies()
+                            for elem in inline_elems:
+                                res_url = (elem.get_attribute("src") or
+                                           elem.get_attribute("data") or
+                                           elem.get_attribute("href"))
+                                if not res_url:
+                                    continue
+                                res_filename = extract_filename_from_url(res_url)
+                                if not res_filename or res_filename.lower().endswith(('.htm', '.html')):
+                                    continue
+                                rsp = session.get(res_url, stream=True)
+                                if rsp.status_code == 200:
+                                    fp = os.path.join(course_path, res_filename)
+                                    with open(fp, 'wb') as f:
+                                        for chunk in rsp.iter_content(chunk_size=8192):
+                                            f.write(chunk)
+                                    files_to_unblock.append(fp)
+                                    downloaded_files.add(res_filename)
+                                    existing_files.add(res_filename)
+                                    total_downloaded_files += 1
+                        except Exception:
+                            pass
                         continue
                     
                     for link_elem in download_links:
@@ -1658,59 +1813,35 @@ if red_activities_to_print:
                                 if len(safe_filename) > 100:
                                     safe_filename = safe_filename[:100]
                                 
-                                # 檢查是否為 Google Sheets 連結
-                                if "docs.google.com/spreadsheets" in actual_url:
+                                # 檢查是否為 Google 雲端連結
+                                is_gdrive = any(d in actual_url for d in (
+                                    'drive.google.com', 'docs.google.com/spreadsheets',
+                                    'docs.google.com/document', 'docs.google.com/presentation'))
+                                if is_gdrive:
                                     try:
-                                        print(f"📊 偵測到 Google Sheets，嘗試下載...")
-                                        
-                                        # 使用 session 以保持登入狀態
                                         session = create_session_with_cookies()
-                                        
-                                        # 提取 spreadsheet ID
-                                        import re
-                                        match = re.search(r'/spreadsheets/d/([a-zA-Z0-9-_]+)', actual_url)
-                                        if match:
-                                            sheet_id = match.group(1)
-                                            
-                                            # 嘗試下載為 Excel 格式
-                                            export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
-                                            
-                                            print(f"   下載 URL: {export_url}")
-                                            response = session.get(export_url, stream=True)
-                                            
-                                            if response.status_code == 200:
-                                                excel_file = os.path.join(course_path, f"{safe_filename}.xlsx")
-                                                with open(excel_file, 'wb') as f:
-                                                    for chunk in response.iter_content(chunk_size=8192):
-                                                        f.write(chunk)
-                                                print(f"{GREEN}✅ 已下載 Google Sheets 為: {os.path.basename(excel_file)}{RESET}")
-                                                files_to_unblock.append(excel_file)
-                                                total_downloaded_files += 1
-                                                existing_files.add(os.path.basename(excel_file))
-                                            else:
-                                                print(f"{YELLOW}⚠️ 無法下載 Google Sheets (可能需要權限){RESET}")
-                                                # 儲存為 Windows 捷徑
-                                                url_file = os.path.join(course_path, f"{safe_filename}.url")
-                                                with open(url_file, 'w', encoding='utf-8') as f:
-                                                    f.write(f"[InternetShortcut]\n")
-                                                    f.write(f"URL={actual_url}\n")
-                                                total_downloaded_files += 1
+                                        fp = try_download_google_drive(actual_url, course_path, safe_filename, session)
+                                        if fp:
+                                            files_to_unblock.append(fp)
+                                            existing_files.add(os.path.basename(fp))
+                                            total_downloaded_files += 1
                                         else:
-                                            print(f"{YELLOW}⚠️ 無法解析 Google Sheets ID{RESET}")
+                                            print(f"{YELLOW}⚠️ 無法下載，已存捷徑{RESET}")
+                                            url_file = os.path.join(course_path, f"{safe_filename}.url")
+                                            with open(url_file, 'w', encoding='utf-8') as f:
+                                                f.write(f"[InternetShortcut]\nURL={actual_url}\n")
+                                            total_downloaded_files += 1
                                     except Exception as e:
-                                        print(f"{RED}❌ 下載 Google Sheets 失敗: {e}{RESET}")
-                                        # 儲存為 Windows 捷徑
+                                        print(f"{RED}❌ 下載失敗: {e}{RESET}")
                                         url_file = os.path.join(course_path, f"{safe_filename}.url")
                                         with open(url_file, 'w', encoding='utf-8') as f:
-                                            f.write(f"[InternetShortcut]\n")
-                                            f.write(f"URL={actual_url}\n")
+                                            f.write(f"[InternetShortcut]\nURL={actual_url}\n")
                                         total_downloaded_files += 1
                                 else:
                                     # 一般連結，儲存為 Windows 捷徑（可直接點擊開啟）
                                     url_file = os.path.join(course_path, f"{safe_filename}.url")
                                     with open(url_file, 'w', encoding='utf-8') as f:
-                                        f.write(f"[InternetShortcut]\n")
-                                        f.write(f"URL={actual_url}\n")
+                                        f.write(f"[InternetShortcut]\nURL={actual_url}\n")
                                     total_downloaded_files += 1
                     else:
                         print(f"{YELLOW}⚠️ 未找到外部連結{RESET}")
@@ -1746,9 +1877,39 @@ if red_activities_to_print:
                             f.write(f"{name}\n")
                             f.write("=" * 60 + "\n\n")
                             f.write(description_text)
-                    
                         total_downloaded_files += 1
                         existing_files.add(os.path.basename(txt_file))
+                        
+                        # 從文字中提取 URL 存為捷徑
+                        import re as _re
+                        _SCHOOL = 'elearningv4.nuk.edu.tw'
+                        url_serial = 0
+                        seen_turls = set()
+                        # 掃描頁面 <a href> 外部連結
+                        try:
+                            desc_elem = driver.find_elements(By.CSS_SELECTOR, "div.activity-description")[0]
+                            for el in desc_elem.find_elements(By.CSS_SELECTOR, "a[href]"):
+                                href = el.get_attribute("href") or ""
+                                if href.startswith("http") and _SCHOOL not in href and href not in seen_turls:
+                                    seen_turls.add(href)
+                        except Exception:
+                            pass
+                        # regex 補捉純文字 URL
+                        for furl in _re.findall(r'https?://\S+', description_text):
+                            furl = furl.rstrip('.,;:\'")') 
+                            if furl and _SCHOOL not in furl and furl not in seen_turls:
+                                seen_turls.add(furl)
+                        # 儲存捷徑
+                        for furl in seen_turls:
+                            url_serial += 1
+                            usuffix = f"_{url_serial}" if url_serial > 1 else ""
+                            ufile = os.path.join(course_path, f"{safe_filename}{usuffix}.url")
+                            try:
+                                with open(ufile, 'w', encoding='utf-8') as uf:
+                                    uf.write(f"[InternetShortcut]\nURL={furl}\n")
+                                total_downloaded_files += 1
+                            except Exception:
+                                pass
                     else:
                         print(f"{YELLOW}⚠️ 未找到討論區描述內容{RESET}")
                         
@@ -1756,7 +1917,144 @@ if red_activities_to_print:
                     print(f"{RED}❌ 處理討論區活動失敗: {e}{RESET}")
                 continue
             
-            # Case 5: 其他類型的活動 (如 page 等) - 無需下載
+            # Case 5: 頁面類型活動 (mod/page) - 儲存文字內容與附件
+            if "mod/page/view.php" in link:
+                try:
+                    safe_pname = "".join(c if c.isalnum() or c in " _-()（）" else "_" for c in name)[:100]
+                    
+                    # 進入頁面
+                    driver.get(link)
+                    session = create_session_with_cookies()
+                    
+                    # 儲存主內容區文字為 .txt（使用 div[role='main'] 精確取主體，排除頁首導覽）
+                    try:
+                        content_elem = driver.find_element(By.CSS_SELECTOR, "div[role='main']")
+                        page_text = content_elem.text.strip()
+                        if page_text:
+                            txt_file = os.path.join(course_path, f"{safe_pname}.txt")
+                            with open(txt_file, 'w', encoding='utf-8') as tf:
+                                tf.write(page_text)
+                            total_downloaded_files += 1
+                    except Exception:
+                        page_text = ""
+                    
+                    # 收集頁面中所有外部連結（<a href> + 文字中的 URL）
+                    import re as _re
+                    _SCHOOL = 'elearningv4.nuk.edu.tw'
+                    external_urls = {}  # url -> base_name
+                    
+                    # 方式1：掃描 <a href> 外部連結
+                    try:
+                        main_elem2 = driver.find_element(By.CSS_SELECTOR, "div[role='main']")
+                        ext_links = main_elem2.find_elements(By.CSS_SELECTOR, "a[href]")
+                        for el in ext_links:
+                            href = el.get_attribute("href") or ""
+                            if (href.startswith("http") and
+                                    _SCHOOL not in href and
+                                    "pluginfile.php" not in href and
+                                    "/theme_" not in href and
+                                    href not in external_urls):
+                                external_urls[href] = href
+                    except Exception:
+                        pass
+                    
+                    # 方式2：從文字中 regex 抓取 URL（補捉純文字貼上的連結）
+                    if page_text:
+                        for furl in _re.findall(r'https?://\S+', page_text):
+                            furl = furl.rstrip('.,;:\'\")')
+                            if furl and _SCHOOL not in furl and furl not in external_urls:
+                                external_urls[furl] = furl
+                    
+                    # 儲存外部連結（Google Drive 嘗試下載，其餘存捷徑）
+                    url_serial = 0
+                    for furl in external_urls:
+                        url_serial += 1
+                        usuffix = f"_{url_serial}" if url_serial > 1 else ""
+                        base_name = f"{safe_pname}{usuffix}"
+                        is_gdrive = any(d in furl for d in (
+                            'drive.google.com', 'docs.google.com/spreadsheets',
+                            'docs.google.com/document', 'docs.google.com/presentation'))
+                        try:
+                            if is_gdrive:
+                                fp = try_download_google_drive(furl, course_path, base_name, session)
+                                if fp:
+                                    files_to_unblock.append(fp)
+                                    downloaded_files.add(os.path.basename(fp))
+                                    existing_files.add(os.path.basename(fp))
+                                    total_downloaded_files += 1
+                                    continue
+                            # 一般連結 or Google Drive 下載失敗 → 存捷徑
+                            ufile = os.path.join(course_path, f"{base_name}.url")
+                            with open(ufile, 'w', encoding='utf-8') as uf:
+                                uf.write(f"[InternetShortcut]\nURL={furl}\n")
+                            total_downloaded_files += 1
+                        except Exception:
+                            pass
+                    
+                    # 下載主內容區內的 pluginfile.php 附件與圖片（排除 theme/icon 等）
+                    try:
+                        main_elem = driver.find_element(By.CSS_SELECTOR, "div[role='main']")
+                        page_res_elems = main_elem.find_elements(By.CSS_SELECTOR,
+                            "a[href*='pluginfile.php'], img[src*='pluginfile.php'], "
+                            "object[data*='pluginfile.php'], embed[src*='pluginfile.php']")
+                    except Exception:
+                        page_res_elems = []
+                    seen_res_urls = set()
+                    for pfe in page_res_elems:
+                        pfl_href = (pfe.get_attribute("href") or
+                                    pfe.get_attribute("src") or
+                                    pfe.get_attribute("data"))
+                        if not pfl_href or pfl_href in seen_res_urls:
+                            continue
+                        seen_res_urls.add(pfl_href)
+                        # 排除布景主題 icon / logo（非課程內容）
+                        if '/theme_' in pfl_href or '/theme/' in pfl_href:
+                            continue
+                        pfl_name = extract_filename_from_url(pfl_href)
+                        if not pfl_name or pfl_name.lower().endswith(('.htm', '.html')):
+                            continue
+                        try:
+                            rsp = session.get(pfl_href, stream=True)
+                            if rsp.status_code == 200:
+                                fp = os.path.join(course_path, pfl_name)
+                                with open(fp, 'wb') as f:
+                                    for chunk in rsp.iter_content(chunk_size=8192):
+                                        f.write(chunk)
+                                files_to_unblock.append(fp)
+                                downloaded_files.add(pfl_name)
+                                existing_files.add(pfl_name)
+                                total_downloaded_files += 1
+                        except Exception:
+                            pass
+                    
+                    # 提取 VideoJS 嵌入影片連結
+                    import json as _json
+                    video_elems_p = driver.find_elements(By.CSS_SELECTOR, "[data-setup-lazy]")
+                    saved_vurls = set()
+                    for velem in video_elems_p:
+                        setup_raw = velem.get_attribute("data-setup-lazy")
+                        if not setup_raw:
+                            continue
+                        try:
+                            setup_data = _json.loads(setup_raw)
+                            for src_item in setup_data.get("sources", []):
+                                src_url = src_item.get("src", "").replace("&amp;", "&")
+                                if src_url and src_url not in saved_vurls:
+                                    saved_vurls.add(src_url)
+                                    vidx = len(saved_vurls)
+                                    vsuffix = f"_影片{vidx}" if vidx > 1 else "_影片"
+                                    vfile = os.path.join(course_path, f"{safe_pname}{vsuffix}.url")
+                                    with open(vfile, 'w', encoding='utf-8') as vf:
+                                        vf.write(f"[InternetShortcut]\nURL={src_url}\n")
+                                    total_downloaded_files += 1
+                                    print(f"🎬 {BLUE}影片連結: {src_url}{RESET}")
+                        except Exception:
+                            pass
+                except Exception as e:
+                    print(f"{RED}❌ 處理頁面活動失敗: {e}{RESET}")
+                continue
+            
+            # Case 6: 其他未知類型 - 略過
 
             
         except Exception as e:
@@ -1794,22 +2092,15 @@ for root, dirs, files in os.walk(download_dir):
     for file in files:
         filepath = os.path.join(root, file)
         if file.endswith((".zip", ".rar", ".7z")):
-            if not IS_FIRST_TIME:
-                print(f"📦 解壓縮: {os.path.basename(file)}")
-
             success = extract_file(filepath, root)
             if success:
                 os.remove(filepath)
-                if not IS_FIRST_TIME:
-                    print(f"   ✅ 完成並刪除原始檔")
                 extracted_count += 1
             else:
                 # 記錄失敗的檔案（特別是 RAR）
                 if file.endswith(".rar"):
                     failed_extract.append(filepath)
 
-if extracted_count > 0 and not IS_FIRST_TIME:
-    print(f"\n{GREEN}✅ 解壓縮完成，共處理 {extracted_count} 個檔案{RESET}")
 
 if failed_extract and not IS_FIRST_TIME:
     print(f"\n{YELLOW}⚠️  以下檔案因工具缺失而未解壓：{RESET}")
@@ -1993,9 +2284,9 @@ for idx, (course_name, course_path) in enumerate(all_courses.items(), 1):
     ibxx += 1
 choice = input(f"\n{PINK}請輸入編號（或輸入 'u' 繳交作業，可用空白分隔多個編號）: {RESET}").strip().lower()
 
+
 # 如果直接按 Enter（空輸入），立即結束程式
 if not choice:
-    # 最快速結束，跳過所有清理操作
     os._exit(0)
 
 # 支援空白分隔多個編號
