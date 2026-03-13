@@ -2173,6 +2173,30 @@ with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
 # 定義背景檢查作業的函數
 def check_assignments_background():
     global empty_assignments, assignment_check_completed
+    from urllib.parse import urlparse, parse_qs
+
+    def build_assignment_key(course_name, act_href):
+        """用課程 + 作業 id 建立穩定鍵值，避免同名作業互相覆蓋。"""
+        assign_id = None
+        try:
+            q = parse_qs(urlparse(act_href).query)
+            assign_id = (q.get('id') or [None])[0]
+        except Exception:
+            assign_id = None
+
+        if assign_id:
+            return f"{course_name}||id:{assign_id}"
+        return f"{course_name}||url:{act_href}"
+
+    def has_submitted_record(records, course_name, act_href, assignment_key):
+        """同時支援新舊格式：key 命中或同課程同網址視為已繳交。"""
+        if assignment_key in records:
+            return True
+        for rec in records.values():
+            if isinstance(rec, dict) and rec.get('course') == course_name and rec.get('url') == act_href:
+                return True
+        return False
+
     # 讀取已繳交作業記錄
     submitted_assignments = load_submitted_assignments()
     
@@ -2210,11 +2234,13 @@ def check_assignments_background():
                     act_href = assign_info['href']
                     act_name = assign_info['name']
                     
-                    # 建立唯一識別鍵 (課程名稱 + 作業名稱)
-                    assignment_key = f"{course_name}||{act_name}"
+                    # 建立唯一識別鍵 (優先使用作業 id)
+                    assignment_key = build_assignment_key(course_name, act_href)
                     
                     # 檢查是否在已繳交記錄中
-                    if assignment_key in submitted_assignments:
+                    if has_submitted_record(submitted_assignments, course_name, act_href, assignment_key):
+                        continue
+                    if has_submitted_record(newly_submitted, course_name, act_href, assignment_key):
                         continue
                     
                     # 沒有記錄，進入頁面檢查
@@ -2261,6 +2287,7 @@ def check_assignments_background():
                             'course': course_name,
                             'name': act_name,
                             'url': act_href,
+                            'assignment_key': assignment_key,
                             'checked_date': time.strftime('%Y-%m-%d %H:%M:%S')
                         }
                     
