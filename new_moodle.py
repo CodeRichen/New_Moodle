@@ -30,6 +30,7 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import StaleElementReferenceException
 from selenium.webdriver.chrome.options import Options
 import time
 import zipfile
@@ -158,7 +159,7 @@ def _write_error_log(exc_type, exc_value, exc_tb, *, source="主執行緒"):
 
 def _global_excepthook(exc_type, exc_value, exc_tb):
     _write_error_log(exc_type, exc_value, exc_tb)
-    print(f"\n\033[31m❌ 程式發生未預期錯誤，詳情已儲存至：\n   {_ERROR_LOG}\033[0m")
+    # print(f"\n\033[31mX 程式發生未預期錯誤，詳情已儲存至：\n   {_ERROR_LOG}\033[0m")
     sys.__excepthook__(exc_type, exc_value, exc_tb)
 
 sys.excepthook = _global_excepthook
@@ -302,14 +303,14 @@ def load_credentials():
                     password = lines[1].strip()
                     if not username or not password:
                         print(f"\n{RED}{'='*60}{RESET}")
-                        print(f"{RED}❌ 錯誤：password.txt 檔案內容不完整{RESET}")
+                        print(f"{RED}X 錯誤：password.txt 檔案內容不完整{RESET}")
                         input()
                         sys.exit(1)
                     IS_FIRST_TIME = False
                     return username, password
                 else:
                     print(f"\n{RED}{'='*60}{RESET}")
-                    print(f"{RED}❌ 錯誤：password.txt 格式錯誤{RESET}")
+                    print(f"{RED}X 錯誤：password.txt 格式錯誤{RESET}")
                     print(f"{RED}{'='*60}{RESET}")
                     print(f"\n{YELLOW}檢查到檔案，但內容不夠兩行{RESET}")
                     print(f"\n📁 檔案位置：{PASSWORD_FILE}")
@@ -341,7 +342,7 @@ def load_credentials():
 
                     break
                 else:
-                    print(f"\n{RED}❌ 帳號不存在或密碼錯誤，請重新輸入{RESET}")
+                    print(f"\n{RED}X 帳號不存在或密碼錯誤，請重新輸入{RESET}")
                     continue
             
             # 登入成功，創建 password.txt 檔案
@@ -351,14 +352,14 @@ def load_credentials():
                 print(f"\n{BLUE}建置環境中{RESET}")
                 return username, password
             except Exception as e:
-                print(f"\n{RED}❌ 無法創建密碼檔案：{e}{RESET}")
+                print(f"\n{RED}X 無法創建密碼檔案：{e}{RESET}")
                 print(f"按 Enter 鍵離開...")
                 input()
                 sys.exit(1)
                 
     except Exception as e:
         print(f"\n{RED}{'='*60}{RESET}")
-        print(f"{RED}❌ 錯誤：讀取 password.txt 失敗{RESET}")
+        print(f"{RED}X 錯誤：讀取 password.txt 失敗{RESET}")
         print(f"{RED}{'='*60}{RESET}")
         print(f"\n錯誤訊息：{e}")
         print(f"\n可能原因：")
@@ -395,6 +396,62 @@ def clean_activity_name(text):
     
     return cleaned
 
+def extract_activity_assets_from_course_page(driver, activity_name):
+    """使用 JavaScript 直接從課程頁取得活動資源，避免 stale element。"""
+    script = """
+    const targetName = arguments[0] || '';
+    const normalize = (s) => (s || '').replace(/\s+/g, ' ').trim();
+    const wanted = normalize(targetName);
+
+    const items = Array.from(document.querySelectorAll('div.activity-item'));
+    for (const item of items) {
+        let currentName = item.getAttribute('data-activityname') || '';
+        if (!currentName) {
+            const instance = item.querySelector('span.instancename');
+            currentName = instance ? instance.textContent : '';
+        }
+        currentName = normalize(currentName);
+        if (currentName !== wanted) {
+            continue;
+        }
+
+        const anchors = Array.from(item.querySelectorAll("a[href*='pluginfile.php']"))
+            .map(a => a.href)
+            .filter(Boolean);
+        const images = Array.from(item.querySelectorAll("img[src*='pluginfile.php']"))
+            .map(img => img.src)
+            .filter(Boolean);
+        const externals = Array.from(item.querySelectorAll("a[href]"))
+            .map(a => a.href)
+            .filter(href => href && !href.includes('pluginfile.php') && !href.startsWith('https://elearningv4.nuk.edu.tw'));
+
+        return {
+            found: true,
+            anchors,
+            images,
+            externals
+        };
+    }
+
+    return {
+        found: false,
+        anchors: [],
+        images: [],
+        externals: []
+    };
+    """
+    try:
+        result = driver.execute_script(script, activity_name)
+        if isinstance(result, dict):
+            result.setdefault('found', False)
+            result.setdefault('anchors', [])
+            result.setdefault('images', [])
+            result.setdefault('externals', [])
+            return result
+    except Exception:
+        pass
+    return {'found': False, 'anchors': [], 'images': [], 'externals': []}
+
 def load_submitted_assignments():
     """讀取已繳交作業記錄"""
     try:
@@ -424,7 +481,7 @@ def open_folder(path):
         else:  # Linux
             subprocess.run(["xdg-open", path])
     except Exception as e:
-        print(f"❌ 無法開啟資料夾: {e}")
+        print(f"X 無法開啟資料夾: {e}")
 
 # 載入舊活動名稱（改為解析為課程+活動 次數）
 existing_activities = set()  # 保留舊行為兼容（只含活動名或檔名）
@@ -557,7 +614,7 @@ for attempt in range(2):
                 continue
             else:  # 最後一次也失敗
                 print(f"\n{RED}{'='*60}{RESET}")
-                print(f"{RED}❌ 登入失敗：無法進入系統{RESET}")
+                print(f"{RED}X 登入失敗：無法進入系統{RESET}")
                 print(f"\n按 Enter 鍵離開...")
                 input()
                 driver.quit()
@@ -572,7 +629,7 @@ for attempt in range(2):
             continue
         else:  # 最後一次也失敗
             print(f"\n{RED}{'='*60}{RESET}")
-            print(f"{RED}❌ 登入失敗：無法連接到 Moodle {RESET}")
+            print(f"{RED}X 登入失敗：無法連接到 Moodle {RESET}")
             print(f"{RED}{'='*60}{RESET}")
             print(f"\n錯誤訊息：{e}")
             print(f"\n按 Enter 鍵離開...")
@@ -581,7 +638,7 @@ for attempt in range(2):
             sys.exit(1)
 
 if not login_success:
-    print(f"\n{RED}❌ 登入失敗{RESET}")
+    print(f"\n{RED}X 登入失敗{RESET}")
     print(f"按 Enter 鍵離開...")
     input()
     driver.quit()
@@ -858,7 +915,7 @@ def process_extracted_data(tab_handle, data, href):
             f.write("\n".join(course_activity_log))
         os.utime(activity_log_path, None)  # 更新時間戳，確保檔案保持最新
     except Exception as e:
-        print(f"{RED}⚠️ 無法寫入活動記錄: {course_name} - {e}{RESET}")
+        print(f"{RED}! 無法寫入活動記錄: {course_name} - {e}{RESET}")
     
     return {
         'course_name': course_name,
@@ -1073,7 +1130,7 @@ def wait_for_download(filename, download_path=None, timeout=300, ask_after=20, s
         # 檢查是否超過 timeout
         if elapsed > timeout:
             if not IS_FIRST_TIME:
-                print(f"{RED}❌ 下載超時：{filename}{RESET}")
+                print(f"{RED}X 下載超時：{filename}{RESET}")
             raise TimeoutError(f"下載超時：{filename}")
 
         time.sleep(0.2)
@@ -1111,12 +1168,12 @@ def extract_file(file_path, dest_dir):
         is_html = header[:15].lower().startswith(b'<!doctype html') or header[:6].lower().startswith(b'<html')
         
         if is_html:
-            print(f"   {YELLOW}⚠️ 檔案不是壓縮檔，而是 HTML 頁面，跳過解壓{RESET}")
+            print(f"   {YELLOW}! 檔案不是壓縮檔，而是 HTML 頁面，跳過解壓{RESET}")
             return False
         
         if file_path.endswith(".zip"):
             if not is_zip:
-                print(f"   {YELLOW}⚠️ 檔案副檔名為 .zip 但不是有效的 ZIP 格式，跳過解壓{RESET}")
+                print(f"   {YELLOW}! 檔案副檔名為 .zip 但不是有效的 ZIP 格式，跳過解壓{RESET}")
                 return False
             
             # 處理 ZIP 檔案的中文檔名亂碼問題
@@ -1140,7 +1197,7 @@ def extract_file(file_path, dest_dir):
                     
         elif file_path.endswith(".rar"):
             if not is_rar:
-                print(f"   {YELLOW}⚠️ 檔案副檔名為 .rar 但不是有效的 RAR 格式，跳過解壓{RESET}")
+                print(f"   {YELLOW}! 檔案副檔名為 .rar 但不是有效的 RAR 格式，跳過解壓{RESET}")
                 return False
             
             # 方法1: 使用 7-Zip（最穩定，Windows 常見）
@@ -1160,7 +1217,7 @@ def extract_file(file_path, dest_dir):
                         if result.returncode == 0:
                             return True
                     except Exception as e:
-                        print(f"{YELLOW}⚠️  7-Zip 解壓失敗: {e}{RESET}")
+                        print(f"{YELLOW}!  7-Zip 解壓失敗: {e}{RESET}")
             
             # 方法2: 優先使用 patool（更穩定，支持多種後端）
             if HAS_PATOOL:
@@ -1168,7 +1225,7 @@ def extract_file(file_path, dest_dir):
                     patool.extract_archive(file_path, outdir=dest_dir, verbosity=-1)
                     return True
                 except Exception as e:
-                    print(f"{YELLOW}⚠️  patool 解壓失敗: {e}{RESET}")
+                    print(f"{YELLOW}!  patool 解壓失敗: {e}{RESET}")
             
             # 方法3: 使用 rarfile
             if HAS_RARFILE:
@@ -1177,10 +1234,10 @@ def extract_file(file_path, dest_dir):
                         rf.extractall(dest_dir)
                     return True
                 except Exception as e:
-                    print(f"{YELLOW}⚠️  rarfile 解壓失敗: {e}{RESET}")
+                    print(f"{YELLOW}!  rarfile 解壓失敗: {e}{RESET}")
             
             # 都失敗，顯示安裝提示
-            print(f"{YELLOW}⚠️  無法解壓 RAR 檔案，已跳過: {os.path.basename(file_path)}{RESET}")
+            print(f"{YELLOW}!  無法解壓 RAR 檔案，已跳過: {os.path.basename(file_path)}{RESET}")
             print(f"   💡 7-Zip 已安裝但無法使用，請嘗試：")
             print(f"   1. 重新啟動終端或電腦")
             print(f"   2. 或手動安裝: winget install 7zip.7zip")
@@ -1188,7 +1245,7 @@ def extract_file(file_path, dest_dir):
             
         elif file_path.endswith(".7z"):
             if not is_7z:
-                print(f"   {YELLOW}⚠️ 檔案副檔名為 .7z 但不是有效的 7Z 格式，跳過解壓{RESET}")
+                print(f"   {YELLOW}! 檔案副檔名為 .7z 但不是有效的 7Z 格式，跳過解壓{RESET}")
                 return False
             
             with py7zr.SevenZipFile(file_path, 'r') as sz:
@@ -1197,10 +1254,10 @@ def extract_file(file_path, dest_dir):
             return False
         return True
     except zipfile.BadZipFile:
-        print(f"   {YELLOW}⚠️ 無效的 ZIP 檔案格式，跳過解壓{RESET}")
+        print(f"   {YELLOW}! 無效的 ZIP 檔案格式，跳過解壓{RESET}")
         return False
     except Exception as e:
-        print(f"❌ 解壓失敗: {os.path.basename(file_path)}, 原因: {e}")
+        print(f"X 解壓失敗: {os.path.basename(file_path)}, 原因: {e}")
         return False
 
 def create_session_with_cookies():
@@ -1351,13 +1408,16 @@ if red_activities_to_print:
             try:
                 driver.get(link)
                 time.sleep(0.2)
-                url_links = driver.find_elements(By.CSS_SELECTOR, "div.urlworkaround a[href]")
-                if url_links:
-                    for url_link in url_links:
-                        actual_url = url_link.get_attribute("href")
-                        if actual_url and not actual_url.startswith("https://elearningv4.nuk.edu.tw"):
-                            display_link = actual_url
-                            break
+                # 用 JS 快照 href，避免動態 DOM 導致 stale element
+                hrefs = driver.execute_script("""
+                    return Array.from(document.querySelectorAll('div.urlworkaround a[href]'))
+                        .map(a => a.getAttribute('href') || a.href)
+                        .filter(Boolean);
+                """) or []
+                for actual_url in hrefs:
+                    if actual_url and not actual_url.startswith("https://elearningv4.nuk.edu.tw"):
+                        display_link = actual_url
+                        break
             except:
                 pass
             
@@ -1384,25 +1444,37 @@ if red_activities_to_print:
                 driver.get(course_url)
                 wait = WebDriverWait(driver, 5)
                 
-                # 找到包含此活動名稱的活動元素
-                activities = driver.find_elements(By.CSS_SELECTOR, "div.activity-item")
-                for act in activities:
-                    act_name = act.get_attribute("data-activityname")
-                    if not act_name:
-                        try:
-                            act_name = clean_activity_name(act.find_element(By.CSS_SELECTOR, "span.instancename").text)
-                        except:
-                            continue
-                    
-                    if act_name == name:
-                        # 找到對應的活動，檢查是否有圖片或連結
-                        try:
-                            session = create_session_with_cookies()
-                            
-                            # 優先抓取 a[href*='pluginfile.php']（含圖片連結，href是原圖）
-                            anchors = act.find_elements(By.CSS_SELECTOR, "a[href*='pluginfile.php']")
-                            for anchor in anchors:
-                                img_url = anchor.get_attribute("href")
+                # 用 JS 一次提取活動資源，避免 DOM 更新造成 stale element
+                try:
+                    session = create_session_with_cookies()
+                    assets = extract_activity_assets_from_course_page(driver, name)
+
+                    if assets.get('found'):
+                        anchors = assets.get('anchors', [])
+                        images = assets.get('images', [])
+                        externals = assets.get('externals', [])
+
+                        for img_url in anchors:
+                            filename = extract_filename_from_url(img_url)
+                            try:
+                                response = session.get(img_url, stream=True)
+                                if response.status_code == 200:
+                                    file_path = os.path.join(course_path, filename)
+                                    with open(file_path, 'wb') as f:
+                                        for chunk in response.iter_content(chunk_size=8192):
+                                            f.write(chunk)
+                                    files_to_unblock.append(file_path)
+                                    downloaded_files.add(filename)
+                                    existing_files.add(filename)
+                                    total_downloaded_files += 1
+                                else:
+                                    print(f"{RED}X 下載失敗: HTTP {response.status_code}{RESET}")
+                            except Exception as e:
+                                print(f"{RED}X 下載失敗: {e}{RESET}")
+
+                        # 若無帶連結的圖片，退而抓取 img[src] 縮圖
+                        if not anchors:
+                            for img_url in images:
                                 filename = extract_filename_from_url(img_url)
                                 try:
                                     response = session.get(img_url, stream=True)
@@ -1416,48 +1488,24 @@ if red_activities_to_print:
                                         existing_files.add(filename)
                                         total_downloaded_files += 1
                                     else:
-                                        print(f"{RED}❌ 下載失敗: HTTP {response.status_code}{RESET}")
+                                        print(f"{RED}X 下載失敗: HTTP {response.status_code}{RESET}")
                                 except Exception as e:
-                                    print(f"{RED}❌ 下載失敗: {e}{RESET}")
-                            
-                            # 若無帶連結的圖片，退而抓取 img[src] 縮圖
-                            if not anchors:
-                                images = act.find_elements(By.CSS_SELECTOR, "img[src*='pluginfile.php']")
-                                for img in images:
-                                    img_url = img.get_attribute("src")
-                                    filename = extract_filename_from_url(img_url)
-                                    try:
-                                        response = session.get(img_url, stream=True)
-                                        if response.status_code == 200:
-                                            file_path = os.path.join(course_path, filename)
-                                            with open(file_path, 'wb') as f:
-                                                for chunk in response.iter_content(chunk_size=8192):
-                                                    f.write(chunk)
-                                            files_to_unblock.append(file_path)
-                                            downloaded_files.add(filename)
-                                            existing_files.add(filename)
-                                            total_downloaded_files += 1
-                                        else:
-                                            print(f"{RED}❌ 下載失敗: HTTP {response.status_code}{RESET}")
-                                    except Exception as e:
-                                        print(f"{RED}❌ 下載失敗: {e}{RESET}")
-                            
-                            # 同時抓取外部連結（非 pluginfile.php 的 a[href]），存為捷徑
-                            ext_anchors = act.find_elements(By.CSS_SELECTOR, "a[href]")
-                            for anchor in ext_anchors:
-                                href = anchor.get_attribute("href")
-                                if href and "pluginfile.php" not in href and not href.startswith("https://elearningv4.nuk.edu.tw"):
-                                    safe_filename = "".join(c if c.isalnum() or c in " _-()（）" else "_" for c in name)
-                                    safe_filename = safe_filename[:100]
-                                    url_file = os.path.join(course_path, f"{safe_filename}.url")
-                                    with open(url_file, 'w', encoding='utf-8') as f:
-                                        f.write(f"[InternetShortcut]\n")
-                                        f.write(f"URL={href}\n")
-                                    total_downloaded_files += 1
-                                    
-                        except Exception as e:
-                            print(f"⚠️ 無法下載圖片: {e}")
-                        break
+                                    print(f"{RED}X 下載失敗: {e}{RESET}")
+
+                        # 同時抓取外部連結（非 pluginfile.php 的 a[href]），存為捷徑
+                        for href in externals:
+                            safe_filename = "".join(c if c.isalnum() or c in " _-()（）" else "_" for c in name)
+                            safe_filename = safe_filename[:100]
+                            url_file = os.path.join(course_path, f"{safe_filename}.url")
+                            with open(url_file, 'w', encoding='utf-8') as f:
+                                f.write(f"[InternetShortcut]\n")
+                                f.write(f"URL={href}\n")
+                            total_downloaded_files += 1
+
+                except StaleElementReferenceException:
+                    print(f"{YELLOW}! 活動內容更新中，已略過本次活動：{name}{RESET}")
+                except Exception as e:
+                    print(f"! 無法下載圖片: {e}")
                 
                 print()
                 continue
@@ -1551,14 +1599,14 @@ if red_activities_to_print:
                             if filename.endswith((".zip", ".rar", ".7z")):
                                 actual_size = os.path.getsize(file_path)
                                 if actual_size < 100:
-                                    print(f"   {YELLOW}⚠️ 壓縮檔太小 ({actual_size} bytes)，可能損壞，跳過解壓{RESET}")
+                                    print(f"   {YELLOW}! 壓縮檔太小 ({actual_size} bytes)，可能損壞，跳過解壓{RESET}")
                                 else:
 
                                     success = extract_file(file_path, course_path)
                                     if success:
                                         os.remove(file_path)
                                     else:
-                                        print(f"   {YELLOW}⚠️ 解壓失敗，保留原始檔{RESET}")
+                                        print(f"   {YELLOW}! 解壓失敗，保留原始檔{RESET}")
                         
                         # 如果有自動下載的檔案，就不需要再找連結了
                         if downloaded_in_this_activity > 0:
@@ -1658,7 +1706,7 @@ if red_activities_to_print:
                             
                             # 檢查檔案大小
                             if file_size == 0 or not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
-                                print(f"{RED}❌ 下載失敗：檔案大小為 0{RESET}")
+                                print(f"{RED}X 下載失敗：檔案大小為 0{RESET}")
                                 if os.path.exists(file_path):
                                     os.remove(file_path)
                                 continue
@@ -1674,7 +1722,7 @@ if red_activities_to_print:
                                 # 再次確認檔案大小
                                 actual_size = os.path.getsize(file_path)
                                 if actual_size < 100:  # 小於100 bytes的壓縮檔很可能是損壞的
-                                    print(f"{YELLOW}⚠️ 壓縮檔太小 ({actual_size} bytes)，可能損壞，跳過解壓{RESET}")
+                                    print(f"{YELLOW}! 壓縮檔太小 ({actual_size} bytes)，可能損壞，跳過解壓{RESET}")
                                 else:
 
                                     success = extract_file(file_path, course_path)
@@ -1682,15 +1730,15 @@ if red_activities_to_print:
                                         os.remove(file_path)
 
                                     else:
-                                        print(f"{YELLOW}   ⚠️ 解壓失敗，保留原始檔{RESET}")
+                                        print(f"{YELLOW}   ! 解壓失敗，保留原始檔{RESET}")
                             
                         except Exception as e:
-                            print(f"{RED}❌ 下載失敗: {e}{RESET}")
+                            print(f"{RED}X 下載失敗: {e}{RESET}")
                             if file_path and os.path.exists(file_path):
                                 os.remove(file_path)
                             
                 except Exception as e:
-                    print(f"{RED}❌ 下載失敗{RESET}")
+                    print(f"{RED}X 下載失敗{RESET}")
                     print(f"   錯誤: {e}")
                     failed_downloads.append({
                         'name': name,
@@ -1729,7 +1777,7 @@ if red_activities_to_print:
                                 existing_files.add(filename)
                                 total_downloaded_files += 1
                         except Exception as e:
-                            print(f"{RED}❌ 下載失敗: {filename}{RESET}")
+                            print(f"{RED}X 下載失敗: {filename}{RESET}")
                             print(f"   錯誤: {e}")
                             failed_downloads.append({
                                 'name': name,
@@ -1741,12 +1789,14 @@ if red_activities_to_print:
                     # 提取作業說明中嵌入的影片連結（例如 YouTube VideoJS）
                     try:
                         import json as _json
-                        video_elems = driver.find_elements(By.CSS_SELECTOR, "div.activity-description [data-setup-lazy]")
+                        # 用 JS 一次取出 data-setup-lazy，避免 WebElement stale
+                        video_setups = driver.execute_script("""
+                            return Array.from(document.querySelectorAll('div.activity-description [data-setup-lazy]'))
+                                .map(el => el.getAttribute('data-setup-lazy'))
+                                .filter(Boolean);
+                        """) or []
                         saved_video_urls = set()
-                        for velem in video_elems:
-                            setup_raw = velem.get_attribute("data-setup-lazy")
-                            if not setup_raw:
-                                continue
+                        for setup_raw in video_setups:
                             try:
                                 setup_data = _json.loads(setup_raw)
                                 sources = setup_data.get("sources", [])
@@ -1769,7 +1819,7 @@ if red_activities_to_print:
                             except Exception:
                                 pass
                     except Exception as e:
-                        print(f"⚠️ 無法提取影片連結: {e}")
+                        print(f"! 無法提取影片連結: {e}")
                 
                 # 找出 submission 區塊內的所有連結（要排除 - 這是已提交的作業）
                 submission_links = set()
@@ -1831,9 +1881,9 @@ if red_activities_to_print:
                             existing_files.add(filename)
                             total_downloaded_files += 1
                         else:
-                            print(f"{RED}❌ 下載失敗: HTTP {response.status_code}{RESET}")
+                            print(f"{RED}X 下載失敗: HTTP {response.status_code}{RESET}")
                     except Exception as e:
-                        print(f"{RED}❌ 下載失敗: {filename}{RESET}")
+                        print(f"{RED}X 下載失敗: {filename}{RESET}")
                         print(f"   錯誤: {e}")
                         failed_downloads.append({
                             'name': name,
@@ -1849,13 +1899,20 @@ if red_activities_to_print:
                     driver.get(link)
                     time.sleep(0.2)
                     
-                    # 尋找實際的外部連結
-                    url_links = driver.find_elements(By.CSS_SELECTOR, "div.urlworkaround a[href]")
-                    
+                    # 用 JS 快照外部連結，避免 stale element
+                    url_links = driver.execute_script("""
+                        return Array.from(document.querySelectorAll('div.urlworkaround a[href]'))
+                            .map(a => ({
+                                href: a.getAttribute('href') || a.href || '',
+                                text: (a.textContent || '').trim()
+                            }))
+                            .filter(x => x.href);
+                    """) or []
+
                     if url_links:
                         for url_link in url_links:
-                            actual_url = url_link.get_attribute("href")
-                            link_text = url_link.text
+                            actual_url = url_link.get("href", "")
+                            link_text = url_link.get("text", "")
                             if actual_url and not actual_url.startswith("https://elearningv4.nuk.edu.tw"):
                                 
                                 # 清理檔案名稱，移除不合法字元
@@ -1877,13 +1934,12 @@ if red_activities_to_print:
                                             existing_files.add(os.path.basename(fp))
                                             total_downloaded_files += 1
                                         else:
-                                            print(f"{YELLOW}⚠️ 無法下載，已存捷徑{RESET}")
                                             url_file = os.path.join(course_path, f"{safe_filename}.url")
                                             with open(url_file, 'w', encoding='utf-8') as f:
                                                 f.write(f"[InternetShortcut]\nURL={actual_url}\n")
                                             total_downloaded_files += 1
                                     except Exception as e:
-                                        print(f"{RED}❌ 下載失敗: {e}{RESET}")
+                                        print(f"{RED}X 下載失敗: {e}{RESET}")
                                         url_file = os.path.join(course_path, f"{safe_filename}.url")
                                         with open(url_file, 'w', encoding='utf-8') as f:
                                             f.write(f"[InternetShortcut]\nURL={actual_url}\n")
@@ -1894,11 +1950,10 @@ if red_activities_to_print:
                                     with open(url_file, 'w', encoding='utf-8') as f:
                                         f.write(f"[InternetShortcut]\nURL={actual_url}\n")
                                     total_downloaded_files += 1
-                    else:
-                        print(f"{YELLOW}⚠️ 未找到外部連結{RESET}")
+
                         
                 except Exception as e:
-                    print(f"{RED}❌ 處理 URL 活動失敗: {e}{RESET}")
+                    print(f"{RED}X 處理 URL 活動失敗: {e}{RESET}")
                 continue
             
             # Case 4: 討論區類型活動 - 提取文字內容並儲存
@@ -1961,11 +2016,10 @@ if red_activities_to_print:
                                 total_downloaded_files += 1
                             except Exception:
                                 pass
-                    else:
-                        print(f"{YELLOW}⚠️ 未找到討論區描述內容{RESET}")
+
                         
                 except Exception as e:
-                    print(f"{RED}❌ 處理討論區活動失敗: {e}{RESET}")
+                    print(f"{RED}X 處理討論區活動失敗: {e}{RESET}")
                 continue
             
             # Case 5: 頁面類型活動 (mod/page) - 儲存文字內容與附件
@@ -2080,12 +2134,14 @@ if red_activities_to_print:
                     
                     # 提取 VideoJS 嵌入影片連結
                     import json as _json
-                    video_elems_p = driver.find_elements(By.CSS_SELECTOR, "[data-setup-lazy]")
+                    # 用 JS 一次取出 data-setup-lazy，避免 WebElement stale
+                    video_setups_p = driver.execute_script("""
+                        return Array.from(document.querySelectorAll('[data-setup-lazy]'))
+                            .map(el => el.getAttribute('data-setup-lazy'))
+                            .filter(Boolean);
+                    """) or []
                     saved_vurls = set()
-                    for velem in video_elems_p:
-                        setup_raw = velem.get_attribute("data-setup-lazy")
-                        if not setup_raw:
-                            continue
+                    for setup_raw in video_setups_p:
                         try:
                             setup_data = _json.loads(setup_raw)
                             for src_item in setup_data.get("sources", []):
@@ -2102,14 +2158,15 @@ if red_activities_to_print:
                         except Exception:
                             pass
                 except Exception as e:
-                    print(f"{RED}❌ 處理頁面活動失敗: {e}{RESET}")
+                    print(f"{RED}X 處理頁面活動失敗: {e}{RESET}")
                 continue
             
             # Case 6: 其他未知類型 - 略過
 
             
         except Exception as e:
-            print(f"{RED}❌ 處理活動時發生錯誤: {e}{RESET}")
+            # print(f"{RED}X 處理活動時發生錯誤: {e}{RESET}")
+            pass
 
     # 所有下載完成後，統一移除 Zone.Identifier
     # print(f"\n📊 下載統計：共下載 {total_downloaded_files} 個檔案")
@@ -2129,7 +2186,7 @@ if red_activities_to_print:
 # 顯示下載失敗的連結
 if failed_downloads and not IS_FIRST_TIME:
     print("\n" + "="*60)
-    print(f"{RED}❌ 以下檔案下載失敗，請手動下載：{RESET}")
+    print(f"{RED}X 以下檔案下載失敗，請手動下載：{RESET}")
     print("="*60)
     for item in failed_downloads:
         print(f"\n📌 {item['name']}")
@@ -2154,7 +2211,7 @@ for root, dirs, files in os.walk(download_dir):
 
 
 if failed_extract and not IS_FIRST_TIME:
-    print(f"\n{YELLOW}⚠️  以下檔案因工具缺失而未解壓：{RESET}")
+    print(f"\n{YELLOW}!  以下檔案因工具缺失而未解壓：{RESET}")
     for f in failed_extract:
         print(f"   - {os.path.basename(f)}")
     print(f"\n💡 建議安裝 patool（自動支持多種解壓工具）：")
@@ -2215,24 +2272,25 @@ def check_assignments_background():
         
         # 找出所有作業連結
         try:
-            assign_links = driver.find_elements(By.CSS_SELECTOR, "div.activity-item a.aalink[href*='mod/assign/view.php']")
-            
-            # 收集所有作業的資訊
-            assignments_info = []
-            for link_elem in assign_links:
-                try:
-                    act_href = link_elem.get_attribute("href")
-                    act_name = clean_activity_name(link_elem.find_element(By.CSS_SELECTOR, "span.instancename").text)
-                    if act_href and act_name:
-                        assignments_info.append({'href': act_href, 'name': act_name})
-                except:
-                    continue
+            # 用 JS 一次快照所有作業 href/name，避免 stale element
+            assignments_info = driver.execute_script("""
+                return Array.from(document.querySelectorAll("div.activity-item a.aalink[href*='mod/assign/view.php']"))
+                    .map(a => {
+                        const span = a.querySelector('span.instancename');
+                        return {
+                            href: a.getAttribute('href') || a.href || '',
+                            name: span ? span.textContent : ''
+                        };
+                    })
+                    .filter(x => x.href && x.name);
+            """) or []
             
             # 迭代收集到的資訊
             for assign_info in assignments_info:
                 try:
                     act_href = assign_info['href']
                     act_name = assign_info['name']
+                    act_name = clean_activity_name(act_name)
                     
                     # 建立唯一識別鍵 (優先使用作業 id)
                     assignment_key = build_assignment_key(course_name, act_href)
