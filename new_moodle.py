@@ -229,7 +229,7 @@ BASE_DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "class")
 OUTPUT_FILE = os.path.join(BASE_DOWNLOAD_DIR, "cless.txt")
 SUBMITTED_ASSIGNMENTS_FILE = os.path.join(BASE_DOWNLOAD_DIR, "submitted_assignments.json")
 PASSWORD_FILE = os.path.join(BASE_DOWNLOAD_DIR, "password.txt")
-BUILDACC_MARKER = "buildacc"
+BUILDERROR_MARKER = "builderror"
 
 # 確保主目錄存在
 os.makedirs(BASE_DOWNLOAD_DIR, exist_ok=True)
@@ -524,12 +524,11 @@ def load_credentials():
                         print(f"{RED}X 錯誤：password.txt 檔案內容不完整{RESET}")
                         input()
                         sys.exit(1)
-                    has_buildacc = len(lines) >= 3 and lines[2].strip().lower() == BUILDACC_MARKER
-                    if has_buildacc:
-                        IS_FIRST_TIME = False
-                    else:
-                        # 尚未完成建置：不要求重新輸入帳密，但維持首次模式。
+                    has_builderror = len(lines) >= 3 and lines[2].strip().lower() == BUILDERROR_MARKER
+                    if has_builderror:
                         IS_FIRST_TIME = True
+                    else:
+                        IS_FIRST_TIME = False
                     return username, password
                 else:
                     print(f"\n{RED}{'='*60}{RESET}")
@@ -571,7 +570,7 @@ def load_credentials():
             # 登入成功，創建 password.txt 檔案
             try:
                 with open(PASSWORD_FILE, 'w', encoding='utf-8') as f:
-                    f.write(f"{username}\n{password}\n")
+                    f.write(f"{username}\n{password}\n{BUILDERROR_MARKER}\n")
                 print(f"\n{BLUE}建置環境中{RESET}")
                 return username, password
             except Exception as e:
@@ -601,11 +600,11 @@ if platform.system() == "Darwin":
 # 載入帳號密碼
 USERNAME, PASSWORD = load_credentials()
 
-def mark_buildacc_completed(username, password):
-    """僅在首次建置完成時，寫入 buildacc 標記。"""
+def clear_builderror_marker(username, password):
+    """首次建置完成後，移除第三行 builderror 標記。"""
     try:
         with open(PASSWORD_FILE, 'w', encoding='utf-8') as f:
-            f.write(f"{username}\n{password}\n{BUILDACC_MARKER}\n")
+            f.write(f"{username}\n{password}\n")
     except Exception:
         pass
 
@@ -2666,7 +2665,7 @@ assignment_check_thread.start()
 # 在結束前詢問是否要開啟任何課程資料夾
 # 如果是第一次使用，跳過選擇並直接結束
 if IS_FIRST_TIME:
-    mark_buildacc_completed(USERNAME, PASSWORD)
+    clear_builderror_marker(USERNAME, PASSWORD)
     print(f"\n{GREEN}環境建置完成{RESET}")
     print(f"\n{YELLOW}可在下次上課前再次執行此程式{RESET}")
     if platform.system() == "Darwin":
