@@ -23,6 +23,7 @@
 - 若遇到問題(檔案下載出現錯誤,執行被中斷等)可以直接修改並PR
 - 也可以和我一樣匯出exe，就不要每次還需要開vscode
 ### 注意事項:
+- 若不希望每次執行自動開啟資料夾，可以在password.txt第三行寫入"nonpop" 
 - 按Enter(輸入環節)或Ctrl+C(執行中)能快速結束程式
 - 看到以下輸出非程式錯誤，不必理會
     - Created TensorFlow Lite XNNPACK delegate for CPU
