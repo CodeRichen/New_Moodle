@@ -230,6 +230,7 @@ OUTPUT_FILE = os.path.join(BASE_DOWNLOAD_DIR, "cless.txt")
 SUBMITTED_ASSIGNMENTS_FILE = os.path.join(BASE_DOWNLOAD_DIR, "submitted_assignments.json")
 PASSWORD_FILE = os.path.join(BASE_DOWNLOAD_DIR, "password.txt")
 BUILDERROR_MARKER = "builderror"
+NONPOP_MARKER = "nonpop"
 
 # 確保主目錄存在
 os.makedirs(BASE_DOWNLOAD_DIR, exist_ok=True)
@@ -268,6 +269,7 @@ _threading_err.excepthook = _thread_excepthook
 
 # 初始化第一次使用標記
 IS_FIRST_TIME = False
+AUTO_OPEN_NEW_ACTIVITY_FOLDERS = True
 
 def get_password_input(prompt):
     """自定義密碼輸入函數，顯示星號（Windows）或隱藏輸入（macOS/Linux）"""
@@ -507,10 +509,33 @@ def setup_chrome():
 
     return True
 
+def append_marker_to_password_file(marker):
+    """將標記追加到 password.txt 檔尾；若已存在則不重複寫入。"""
+    if not marker:
+        return
+    normalized = marker.strip().lower()
+    if not normalized:
+        return
+
+    lines = []
+    raw_text = ""
+    if os.path.exists(PASSWORD_FILE):
+        with open(PASSWORD_FILE, 'r', encoding='utf-8') as f:
+            raw_text = f.read()
+            lines = raw_text.splitlines()
+
+    if any(line.strip().lower() == normalized for line in lines):
+        return
+
+    with open(PASSWORD_FILE, 'a', encoding='utf-8') as f:
+        if raw_text and not raw_text.endswith("\n"):
+            f.write("\n")
+        f.write(f"{marker.strip()}\n")
+
 # 讀取帳號密碼
 def load_credentials():
     """從 password.txt 讀取帳號密碼，如果不存在則讓使用者輸入並創建"""
-    global IS_FIRST_TIME  # 使用全域變數來追蹤是否為第一次使用
+    global IS_FIRST_TIME, AUTO_OPEN_NEW_ACTIVITY_FOLDERS  # 使用全域變數來追蹤狀態
     
     try:
         if os.path.exists(PASSWORD_FILE):
@@ -524,11 +549,14 @@ def load_credentials():
                         print(f"{RED}X 錯誤：password.txt 檔案內容不完整{RESET}")
                         input()
                         sys.exit(1)
-                    has_builderror = len(lines) >= 3 and lines[2].strip().lower() == BUILDERROR_MARKER
+                    markers = {line.strip().lower() for line in lines[2:] if line.strip()}
+                    has_builderror = any(line.strip().lower() == BUILDERROR_MARKER for line in lines)
+                    has_nonpop = NONPOP_MARKER in markers
                     if has_builderror:
                         IS_FIRST_TIME = True
                     else:
                         IS_FIRST_TIME = False
+                    AUTO_OPEN_NEW_ACTIVITY_FOLDERS = not has_nonpop
                     return username, password
                 else:
                     print(f"\n{RED}{'='*60}{RESET}")
@@ -545,6 +573,7 @@ def load_credentials():
         else:
             # 第一次使用，讓使用者輸入帳號密碼
             IS_FIRST_TIME = True
+            AUTO_OPEN_NEW_ACTIVITY_FOLDERS = True
             print(f"{YELLOW}請輸入你的 Moodle 帳號密碼：{RESET}")
             
             while True:  # 持續輸入直到登入成功
@@ -570,7 +599,8 @@ def load_credentials():
             # 登入成功，創建 password.txt 檔案
             try:
                 with open(PASSWORD_FILE, 'w', encoding='utf-8') as f:
-                    f.write(f"{username}\n{password}\n{BUILDERROR_MARKER}\n")
+                    f.write(f"{username}\n{password}\n")
+                append_marker_to_password_file(BUILDERROR_MARKER)
                 print(f"\n{BLUE}建置環境中{RESET}")
                 return username, password
             except Exception as e:
@@ -603,8 +633,18 @@ USERNAME, PASSWORD = load_credentials()
 def clear_builderror_marker(username, password):
     """首次建置完成後，移除第三行 builderror 標記。"""
     try:
+        kept_markers = []
+        if os.path.exists(PASSWORD_FILE):
+            with open(PASSWORD_FILE, 'r', encoding='utf-8') as f:
+                lines = f.read().splitlines()
+            for line in lines[2:]:
+                marker = line.strip()
+                if marker and marker.lower() != BUILDERROR_MARKER:
+                    kept_markers.append(marker)
         with open(PASSWORD_FILE, 'w', encoding='utf-8') as f:
             f.write(f"{username}\n{password}\n")
+            for marker in kept_markers:
+                f.write(f"{marker}\n")
     except Exception:
         pass
 
@@ -1642,7 +1682,7 @@ def try_download_google_drive(gdrive_url, dest_dir, base_name, session):
     return None
 
     # 🔴 先自動開啟所有紅色課程的資料夾
-if red_activities_to_print and not IS_FIRST_TIME:
+if red_activities_to_print and not IS_FIRST_TIME and AUTO_OPEN_NEW_ACTIVITY_FOLDERS:
    
 
     
@@ -1860,7 +1900,6 @@ if red_activities_to_print:
                     if actual_new_files:
                         for filename in actual_new_files:
                             if filename.lower().endswith(('.htm', '.html')):
-                                print(f"   ⏭️  跳過 HTML 文件: {filename}")
                                 file_to_remove = os.path.join(course_path, filename)
                                 try:
                                     os.remove(file_to_remove)
@@ -2447,7 +2486,6 @@ if red_activities_to_print:
         except StaleElementReferenceException:
             # stale element：DOM 自動更新導致元素失效
             # 對策：延遲後跳過，下一輪執行時會重試此活動
-            print(f"{YELLOW}! 活動元素已過期（stale element），延遲 2 秒後繼續下一個...{RESET}")
             time.sleep(2)
         except Exception as e:
             # print(f"{RED}X 處理活動時發生錯誤: {e}{RESET}")
