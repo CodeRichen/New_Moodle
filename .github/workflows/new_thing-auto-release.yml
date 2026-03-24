@@ -42,7 +42,7 @@ jobs:
 
       - name: Build executable
         run: |
-          python -m PyInstaller --clean --noconfirm --onefile --console --name "${{ matrix.binary_name }}" --hidden-import selenium.webdriver.chrome.webdriver --hidden-import selenium.webdriver.chrome.service --hidden-import selenium.webdriver.chrome.options --hidden-import selenium.webdriver.common.by --hidden-import selenium.webdriver.support.ui --hidden-import selenium.webdriver.support.expected_conditions --hidden-import selenium.webdriver.support --hidden-import webdriver_manager.chrome --hidden-import webdriver_manager.core.driver_cache --hidden-import webdriver_manager.core.manager --hidden-import gdown "new_thing.py"
+          python -m PyInstaller --clean --noconfirm --onefile --console --name "${{ matrix.binary_name }}" --hidden-import selenium.webdriver.chrome.webdriver --hidden-import selenium.webdriver.chrome.service --hidden-import selenium.webdriver.chrome.options --hidden-import selenium.webdriver.common.by --hidden-import selenium.webdriver.support.ui --hidden-import selenium.webdriver.support.expected_conditions --hidden-import selenium.webdriver.support --hidden-import webdriver_manager.chrome --hidden-import webdriver_manager.core.driver_cache --hidden-import webdriver_manager.core.manager --hidden-import gdown "new_moodle.py"
 
       - name: Prepare packaged binary
         shell: bash
