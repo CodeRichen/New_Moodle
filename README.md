@@ -19,8 +19,8 @@
 - 免責聲明:就算程式碼是對的，如果未來moodle版本更新或是老師上傳不同格式的檔案，跑出來的結果就會有問題，請定期驗證資料的正確性
 - 如果是Mac，在下載之後請在終端機當中進入其所在的資料夾，輸入下面的指令將文字檔轉成執行檔
 ```powershell
-xattr -d com.apple.quarantine new_thing
-chmod +x new_thing
+xattr -d com.apple.quarantine new_thing-macos
+chmod +x new_thing-macos
 ```
 ### 有VScode
 - 直接複製我的原始碼
