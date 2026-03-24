@@ -130,6 +130,37 @@ def should_use_safari_fallback():
     force_chrome = os.environ.get("FORCE_CHROME", "0").strip().lower() in {"1", "true", "yes", "on"}
     return platform.system() == "Darwin" and not force_chrome and get_chrome_binary_path() is None
 
+def _prepare_windows_chrome_options(chrome_options, profile_tag="default"):
+    """Windows 啟動穩定化：補齊必要參數並使用獨立 profile。"""
+    if os.name != 'nt' or chrome_options is None:
+        return chrome_options
+
+    existing_args = set(chrome_options.arguments)
+
+    def _add_arg(arg):
+        if arg not in existing_args:
+            chrome_options.add_argument(arg)
+            existing_args.add(arg)
+
+    _add_arg("--remote-debugging-port=0")
+    _add_arg("--disable-gpu")
+    _add_arg("--disable-dev-shm-usage")
+    _add_arg("--no-sandbox")
+    _add_arg("--disable-features=RendererCodeIntegrity")
+    _add_arg("--no-first-run")
+    _add_arg("--no-default-browser-check")
+
+    if not any(arg.startswith("--user-data-dir=") for arg in existing_args):
+        profile_dir = os.path.join(
+            BASE_DOWNLOAD_DIR,
+            f"chrome_profile_{profile_tag}_{int(time.time())}_{os.getpid()}"
+        )
+        os.makedirs(profile_dir, exist_ok=True)
+        _add_arg(f"--user-data-dir={profile_dir}")
+
+    return chrome_options
+
+
 def create_webdriver(chrome_options=None, *, hide_windows_console=False):
     """統一建立 WebDriver，必要時在 macOS 回退 Safari。"""
     force_chrome = os.environ.get("FORCE_CHROME", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -138,18 +169,22 @@ def create_webdriver(chrome_options=None, *, hide_windows_console=False):
         print("[INFO] macOS 未偵測到 Chrome，改用 Safari WebDriver。")
         return webdriver.Safari()
 
-    def _create_chrome_driver():
+    if os.name == 'nt' and chrome_options is not None:
+        _prepare_windows_chrome_options(chrome_options, profile_tag="main")
+
+    def _create_chrome_driver(options_to_use=None):
+        active_options = options_to_use if options_to_use is not None else chrome_options
         driver_path = get_chrome_driver_path()
         if driver_path:
             service = Service(driver_path, log_path=os.devnull)
             if os.name == 'nt' and hide_windows_console:
                 service.creation_flags = subprocess.CREATE_NO_WINDOW
-            if chrome_options is not None:
-                return webdriver.Chrome(options=chrome_options, service=service)
+            if active_options is not None:
+                return webdriver.Chrome(options=active_options, service=service)
             return webdriver.Chrome(service=service)
 
-        if chrome_options is not None:
-            return webdriver.Chrome(options=chrome_options)
+        if active_options is not None:
+            return webdriver.Chrome(options=active_options)
         return webdriver.Chrome()
 
     # macOS 上即使找到 Chrome，仍可能因安裝不完整造成啟動失敗，這時回退 Safari。
@@ -159,6 +194,24 @@ def create_webdriver(chrome_options=None, *, hide_windows_console=False):
         except (SessionNotCreatedException, WebDriverException) as e:
             print(f"[WARN] Chrome 啟動失敗，改用 Safari。原因: {e}")
             return webdriver.Safari()
+
+    # Windows 偶發 DevToolsActivePort 問題時，自動換 profile 重試一次。
+    if os.name == 'nt':
+        try:
+            return _create_chrome_driver()
+        except WebDriverException as e:
+            if "DevToolsActivePort" in str(e):
+                retry_options = Options()
+                if chrome_options is not None:
+                    for arg in chrome_options.arguments:
+                        retry_options.add_argument(arg)
+                    retry_options.page_load_strategy = chrome_options.page_load_strategy
+                    retry_options.binary_location = chrome_options.binary_location
+                    for key, value in chrome_options.experimental_options.items():
+                        retry_options.add_experimental_option(key, value)
+                _prepare_windows_chrome_options(retry_options, profile_tag="retry")
+                return _create_chrome_driver(retry_options)
+            raise
 
     return _create_chrome_driver()
 
@@ -204,13 +257,18 @@ _USE_COLOR = _supports_color()
 
 if _USE_COLOR:
     YELLOW   = "\033[33m"
-    RED      = "\033[38;2;255;105;180m"
+    # macOS 終端機改用較穩定、接近原色的紅綠色
+    if platform.system() == "Darwin":
+        RED      = "\033[38;2;255;99;132m"
+        GREEN    = "\033[38;2;46;204;113m"
+    else:
+        RED      = "\033[38;2;255;105;180m"
+        GREEN    = "\033[38;2;055;205;180m"
     BLUE     = "\033[34m"
     BBLUE    = "\033[94m"
     ITALIC   = "\033[3;37m"
     MIKU     = "\033[36m"
     LOWGREEN = "\033[32m"
-    GREEN    = "\033[38;2;055;205;180m"
     PURPLE   = "\033[38;5;129m"
     ORANGE   = "\033[38;5;214m"
     RESET    = "\033[0m"
@@ -306,7 +364,10 @@ def test_login(username, password):
     try:
         # 創建臨時瀏覽器進行登入測試
         test_chrome_options = Options()
-        test_chrome_options.add_argument("--headless")
+        if os.name == 'nt':
+            test_chrome_options.add_argument("--headless=new")
+        else:
+            test_chrome_options.add_argument("--headless")
         test_chrome_options.add_argument("--disable-gpu")
         test_chrome_options.add_argument("--log-level=3")
         test_chrome_options.add_argument("--disable-extensions")
@@ -405,7 +466,10 @@ def setup_chrome():
         if not binary_path:
             return False
         test_options = Options()
-        test_options.add_argument("--headless")
+        if os.name == 'nt':
+            test_options.add_argument("--headless=new")
+        else:
+            test_options.add_argument("--headless")
         test_options.add_argument("--disable-gpu")
         test_options.add_argument("--no-sandbox")
         test_options.add_argument("--disable-dev-shm-usage")
@@ -811,7 +875,10 @@ def create_course_folder(course_name):
     return course_path
 
 chrome_options = Options()
-chrome_options.add_argument("--headless")  # 無頭模式
+if os.name == 'nt':
+    chrome_options.add_argument("--headless=new")  # Windows 較穩定
+else:
+    chrome_options.add_argument("--headless")  # 無頭模式
 chrome_options.add_argument("--disable-gpu")  # 防止顯示錯誤
 chrome_options.add_argument("--log-level=3")  # 降低日誌等級，避免雜訊
 chrome_options.add_argument("--window-size=1920,1080")  # 設定解析度，避免元素渲染錯誤
@@ -1362,6 +1429,48 @@ def remove_zone_identifier(filepath):
         )
     except Exception:
         pass
+
+def unblock_office_files_in_dir(root_dir):
+    """最終保險：掃描資料夾內 Office/PDF 檔並解除封鎖。"""
+    if os.name != 'nt' or not root_dir or not os.path.exists(root_dir):
+        return
+    office_exts = {".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".pdf"}
+    for cur_root, _, files in os.walk(root_dir):
+        for filename in files:
+            _, ext = os.path.splitext(filename)
+            if ext.lower() in office_exts:
+                remove_zone_identifier(os.path.join(cur_root, filename))
+
+def ensure_unique_filename(filepath):
+    """
+    檢查檔案是否已存在。若存在，自動改名為 filename (1).ext, (2).ext 等。
+    返回可安全使用的檔案路徑，不會覆蓋既有檔案。
+    """
+    if not os.path.exists(filepath):
+        return filepath
+    
+    dirname = os.path.dirname(filepath)
+    basename = os.path.basename(filepath)
+    
+    # 分離檔名和副檔名
+    if '.' in basename:
+        name_part, ext_part = basename.rsplit('.', 1)
+        ext_part = '.' + ext_part
+    else:
+        name_part = basename
+        ext_part = ''
+    
+    # 嘗試找不重複的檔名
+    counter = 1
+    while counter <= 999:
+        new_name = f"{name_part} ({counter}){ext_part}"
+        new_path = os.path.join(dirname, new_name)
+        if not os.path.exists(new_path):
+            return new_path
+        counter += 1
+    
+    # 如果 999 個都重複了（不太可能），就直接用原名
+    return filepath
         
 def wait_for_download(filename, download_path=None, timeout=300, ask_after=20, size_limit_mb=50):
     """
@@ -1656,7 +1765,7 @@ def try_download_google_drive(gdrive_url, dest_dir, base_name, session):
     m = _re.search(r'spreadsheets/d/([a-zA-Z0-9_-]+)', url)
     if m:
         sid = m.group(1)
-        fp = os.path.join(dest_dir, f"{base_name}.xlsx")
+        fp = ensure_unique_filename(os.path.join(dest_dir, f"{base_name}.xlsx"))
         if _export_stream(f"https://docs.google.com/spreadsheets/d/{sid}/export?format=xlsx", fp):
             return fp
         return None
@@ -1665,7 +1774,7 @@ def try_download_google_drive(gdrive_url, dest_dir, base_name, session):
     m = _re.search(r'document/d/([a-zA-Z0-9_-]+)', url)
     if m:
         did = m.group(1)
-        fp = os.path.join(dest_dir, f"{base_name}.docx")
+        fp = ensure_unique_filename(os.path.join(dest_dir, f"{base_name}.docx"))
         if _export_stream(f"https://docs.google.com/document/d/{did}/export?format=docx", fp):
             return fp
         return None
@@ -1674,7 +1783,7 @@ def try_download_google_drive(gdrive_url, dest_dir, base_name, session):
     m = _re.search(r'presentation/d/([a-zA-Z0-9_-]+)', url)
     if m:
         pid = m.group(1)
-        fp = os.path.join(dest_dir, f"{base_name}.pptx")
+        fp = ensure_unique_filename(os.path.join(dest_dir, f"{base_name}.pptx"))
         if _export_stream(f"https://docs.google.com/presentation/d/{pid}/export?format=pptx", fp):
             return fp
         return None
@@ -1777,7 +1886,7 @@ if red_activities_to_print:
                             try:
                                 response = session.get(img_url, stream=True)
                                 if response.status_code == 200:
-                                    file_path = os.path.join(course_path, filename)
+                                    file_path = ensure_unique_filename(os.path.join(course_path, filename))
                                     with open(file_path, 'wb') as f:
                                         for chunk in response.iter_content(chunk_size=8192):
                                             f.write(chunk)
@@ -1797,7 +1906,7 @@ if red_activities_to_print:
                                 try:
                                     response = session.get(img_url, stream=True)
                                     if response.status_code == 200:
-                                        file_path = os.path.join(course_path, filename)
+                                        file_path = ensure_unique_filename(os.path.join(course_path, filename))
                                         with open(file_path, 'wb') as f:
                                             for chunk in response.iter_content(chunk_size=8192):
                                                 f.write(chunk)
@@ -1855,7 +1964,7 @@ if red_activities_to_print:
                                 session = create_session_with_cookies()
                                 rsp = session.get(redirect_url, stream=True)
                                 if rsp.status_code == 200:
-                                    fp = os.path.join(course_path, redirect_filename)
+                                    fp = ensure_unique_filename(os.path.join(course_path, redirect_filename))
                                     with open(fp, 'wb') as f:
                                         for chunk in rsp.iter_content(chunk_size=8192):
                                             f.write(chunk)
@@ -1907,7 +2016,7 @@ if red_activities_to_print:
                                     pass
                                 continue
                             
-                            file_path = os.path.join(course_path, filename)
+                            file_path = ensure_unique_filename(os.path.join(course_path, filename))
                             files_to_unblock.append(file_path)
                             downloaded_files.add(filename)
                             existing_files.add(filename)
@@ -1981,7 +2090,7 @@ if red_activities_to_print:
                                     continue
                                 rsp = session.get(res_url, stream=True)
                                 if rsp.status_code == 200:
-                                    fp = os.path.join(course_path, res_filename)
+                                    fp = ensure_unique_filename(os.path.join(course_path, res_filename))
                                     with open(fp, 'wb') as f:
                                         for chunk in rsp.iter_content(chunk_size=8192):
                                             f.write(chunk)
@@ -2015,7 +2124,7 @@ if red_activities_to_print:
                             response = session.get(dl_href, stream=True)
                             response.raise_for_status()  # 確保狀態碼正常
                             
-                            file_path = os.path.join(course_path, filename)
+                            file_path = ensure_unique_filename(os.path.join(course_path, filename))
                             file_size = 0
                             with open(file_path, 'wb') as f:
                                 for chunk in response.iter_content(chunk_size=8192):
@@ -2189,7 +2298,7 @@ if red_activities_to_print:
                         response = session.get(f_href, stream=True)
                         
                         if response.status_code == 200:
-                            file_path = os.path.join(course_path, filename)
+                            file_path = ensure_unique_filename(os.path.join(course_path, filename))
                             with open(file_path, 'wb') as f:
                                 for chunk in response.iter_content(chunk_size=8192):
                                     if chunk:
@@ -2440,7 +2549,7 @@ if red_activities_to_print:
                         try:
                             rsp = session.get(pfl_href, stream=True)
                             if rsp.status_code == 200:
-                                fp = os.path.join(course_path, pfl_name)
+                                fp = ensure_unique_filename(os.path.join(course_path, pfl_name))
                                 with open(fp, 'wb') as f:
                                     for chunk in rsp.iter_content(chunk_size=8192):
                                         f.write(chunk)
@@ -2541,6 +2650,9 @@ if failed_extract and not IS_FIRST_TIME:
     print(f"\n💡 建議安裝 patool（自動支持多種解壓工具）：")
     print(f"   {BLUE}pip install patool{RESET}")
     print(f"   或手動下載 UnRAR: https://www.rarlab.com/rar_add.htm")
+
+# 最終保險：確保 Word/PPT/PDF 檔案都已解除封鎖
+unblock_office_files_in_dir(download_dir)
 
 # 按照課程名稱字母順序整理輸出並更新 output.txt
 course_results.sort(key=lambda x: x[1]['course_name'])  # 按課程名稱字母排序

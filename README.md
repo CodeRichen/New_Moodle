@@ -12,11 +12,16 @@
   
 **是的，每次執行都會列出所有課程的最新資訊，並且需要的檔案也可以自行從電腦傳輸到其他設備，作業上傳的部分也能夠被程式實現**
 ## 我該如何開始?
-點擊你在Releases下載下來的moodle.exe檔案(可以放置在電腦的任何位置)，但需要使用你的帳號密碼登入
+點擊你在Releases下載下來的new_thing.exe檔案(可以放置在電腦的任何位置)，但需要使用你的帳號密碼登入
 ### 沒有編譯器
-- 進入右方Releases下載最新版本的new_things.exe檔案
+- 進入右方Releases下載最新版本的new_thing.exe檔案
 - 雙擊執行exe檔案，輸入帳號密碼後等待環境建置(約1分鐘)，隔天(下次上課前)再次執行同檔案即可
 - 免責聲明:就算程式碼是對的，如果未來moodle版本更新或是老師上傳不同格式的檔案，跑出來的結果就會有問題，請定期驗證資料的正確性
+- 如果是Mac，在下載之後請在終端機當中進入其所在的資料夾，輸入下面的指令將文字檔轉成執行檔
+```powershell
+xattr -d com.apple.quarantine new_thing
+chmod +x new_thing
+```
 ### 有VScode
 - 直接複製我的原始碼
 - 找到程式碼當中TODO的部分，自行修改password的讀取位置及讀取方式(可用AI)
@@ -29,4 +34,5 @@
     - Created TensorFlow Lite XNNPACK delegate for CPU
     - DevTools listening on ws://127.0.0.1
     - GetGpuDriverOverlayInfo: Failed to retrieve video device
+
 ### 程式說明: [https://hackmd.io/wJQ18WJPRYO5IXklfe0_GQ](https://hackmd.io/@richen/SkASnFgB-x)
