@@ -33,6 +33,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import StaleElementReferenceException, SessionNotCreatedException, WebDriverException
 from selenium.webdriver.chrome.options import Options
 import time
+import tempfile
 import zipfile
 import py7zr
 import requests  # 用於直接下載圖片
@@ -130,8 +131,14 @@ def should_use_safari_fallback():
     force_chrome = os.environ.get("FORCE_CHROME", "0").strip().lower() in {"1", "true", "yes", "on"}
     return platform.system() == "Darwin" and not force_chrome and get_chrome_binary_path() is None
 
-def _prepare_windows_chrome_options(chrome_options, profile_tag="default"):
-    """Windows 啟動穩定化：補齊必要參數並使用獨立 profile。"""
+def _is_chrome_startup_issue(exc):
+    """判斷是否屬於可透過更換 profile 重試的 Chrome 啟動問題。"""
+    msg = str(exc)
+    keywords = ["DevToolsActivePort", "Chrome failed to start", "session not created", "chrome not reachable"]
+    return any(k in msg for k in keywords)
+
+def _prepare_windows_chrome_options(chrome_options):
+    """Windows 啟動穩定化：補齊必要參數。"""
     if os.name != 'nt' or chrome_options is None:
         return chrome_options
 
@@ -150,14 +157,6 @@ def _prepare_windows_chrome_options(chrome_options, profile_tag="default"):
     _add_arg("--no-first-run")
     _add_arg("--no-default-browser-check")
 
-    if not any(arg.startswith("--user-data-dir=") for arg in existing_args):
-        profile_dir = os.path.join(
-            BASE_DOWNLOAD_DIR,
-            f"chrome_profile_{profile_tag}_{int(time.time())}_{os.getpid()}"
-        )
-        os.makedirs(profile_dir, exist_ok=True)
-        _add_arg(f"--user-data-dir={profile_dir}")
-
     return chrome_options
 
 
@@ -170,7 +169,7 @@ def create_webdriver(chrome_options=None, *, hide_windows_console=False):
         return webdriver.Safari()
 
     if os.name == 'nt' and chrome_options is not None:
-        _prepare_windows_chrome_options(chrome_options, profile_tag="main")
+        _prepare_windows_chrome_options(chrome_options)
 
     def _create_chrome_driver(options_to_use=None):
         active_options = options_to_use if options_to_use is not None else chrome_options
@@ -200,7 +199,7 @@ def create_webdriver(chrome_options=None, *, hide_windows_console=False):
         try:
             return _create_chrome_driver()
         except WebDriverException as e:
-            if "DevToolsActivePort" in str(e):
+            if _is_chrome_startup_issue(e):
                 retry_options = Options()
                 if chrome_options is not None:
                     for arg in chrome_options.arguments:
@@ -209,8 +208,25 @@ def create_webdriver(chrome_options=None, *, hide_windows_console=False):
                     retry_options.binary_location = chrome_options.binary_location
                     for key, value in chrome_options.experimental_options.items():
                         retry_options.add_experimental_option(key, value)
-                _prepare_windows_chrome_options(retry_options, profile_tag="retry")
-                return _create_chrome_driver(retry_options)
+                _prepare_windows_chrome_options(retry_options)
+                try:
+                    return _create_chrome_driver(retry_options)
+                except WebDriverException as second_error:
+                    # 無固定 profile 仍無法啟動時，退回一次臨時 profile 做最後保底。
+                    if _is_chrome_startup_issue(second_error):
+                        fallback_options = Options()
+                        for arg in retry_options.arguments:
+                            if not arg.startswith("--user-data-dir="):
+                                fallback_options.add_argument(arg)
+                        fallback_options.page_load_strategy = retry_options.page_load_strategy
+                        fallback_options.binary_location = retry_options.binary_location
+                        for key, value in retry_options.experimental_options.items():
+                            fallback_options.add_experimental_option(key, value)
+
+                        fallback_dir = tempfile.mkdtemp(prefix="chrome_profile_fallback_", dir=BASE_DOWNLOAD_DIR)
+                        fallback_options.add_argument(f"--user-data-dir={fallback_dir}")
+                        return _create_chrome_driver(fallback_options)
+                    raise
             raise
 
     return _create_chrome_driver()
@@ -1459,7 +1475,7 @@ def ensure_unique_filename(filepath):
     else:
         name_part = basename
         ext_part = ''
-    
+
     # 嘗試找不重複的檔名
     counter = 1
     while counter <= 999:
@@ -2918,24 +2934,13 @@ if choice == 'u':
             if os.name == 'nt':
                 chrome_options_visible.add_argument("--no-sandbox")
                 chrome_options_visible.add_argument("--disable-features=RendererCodeIntegrity")
-                visible_profile_dir = os.path.join(
-                    BASE_DOWNLOAD_DIR,
-                    f"chrome_profile_submit_{int(time.time())}_{os.getpid()}"
-                )
-                os.makedirs(visible_profile_dir, exist_ok=True)
-                chrome_options_visible.add_argument(f"--user-data-dir={visible_profile_dir}")
             apply_chrome_binary_option(chrome_options_visible)
             try:
                 driver = create_webdriver(chrome_options_visible, hide_windows_console=True)
             except WebDriverException as e:
-                # Windows 偶發 DevToolsActivePort 啟動失敗：換新 profile 目錄再重試一次
+                # Windows 偶發 DevToolsActivePort 啟動失敗：改用臨時 profile 再重試
                 if os.name == 'nt':
                     time.sleep(1)
-                    retry_profile_dir = os.path.join(
-                        BASE_DOWNLOAD_DIR,
-                        f"chrome_profile_submit_retry_{int(time.time())}_{os.getpid()}"
-                    )
-                    os.makedirs(retry_profile_dir, exist_ok=True)
                     chrome_options_visible_retry = Options()
                     chrome_options_visible_retry.add_argument("--log-level=3")
                     chrome_options_visible_retry.add_experimental_option("excludeSwitches", ["enable-logging"])
@@ -2944,7 +2949,8 @@ if choice == 'u':
                     chrome_options_visible_retry.add_argument("--remote-debugging-port=0")
                     chrome_options_visible_retry.add_argument("--no-sandbox")
                     chrome_options_visible_retry.add_argument("--disable-features=RendererCodeIntegrity")
-                    chrome_options_visible_retry.add_argument(f"--user-data-dir={retry_profile_dir}")
+                    submit_fallback_dir = tempfile.mkdtemp(prefix="chrome_profile_submit_fallback_", dir=BASE_DOWNLOAD_DIR)
+                    chrome_options_visible_retry.add_argument(f"--user-data-dir={submit_fallback_dir}")
                     apply_chrome_binary_option(chrome_options_visible_retry)
                     driver = create_webdriver(chrome_options_visible_retry, hide_windows_console=True)
                 else:
