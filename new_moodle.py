@@ -2241,7 +2241,7 @@ if red_activities_to_print:
                     if not download_links:
                         # 可能還有 .crdownload 正在下載
                         if crdownload_files:
-                            # print(f"   ⏳ 發現 {len(crdownload_files)} 個正在下載的檔案")
+                            # print(f"   發現 {len(crdownload_files)} 個正在下載的檔案")
                             # 等待 .crdownload 完成
                             for cr_file in crdownload_files:
                                 base_filename = cr_file[:-11]  # 移除 .crdownload
