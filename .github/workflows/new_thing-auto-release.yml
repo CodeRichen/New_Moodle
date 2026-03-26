@@ -21,10 +21,17 @@ jobs:
             label: Windows
             binary_name: new_thing-windows
             extension: .exe
+            python_arch: x64
           - os: macos-latest
-            label: macOS
-            binary_name: new_thing-macos
+            label: macOS (Intel)
+            binary_name: new_thing-macos-intel
             extension: ""
+            python_arch: x64
+          - os: macos-latest
+            label: macOS (Apple Silicon)
+            binary_name: new_thing-macos-arm64
+            extension: ""
+            python_arch: arm64
 
     steps:
       - name: Checkout
@@ -34,6 +41,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          architecture: ${{ matrix.python_arch }}
 
       - name: Install dependencies
         run: |
@@ -42,7 +50,7 @@ jobs:
 
       - name: Build executable
         run: |
-          python -m PyInstaller --clean --noconfirm --onefile --console --name "${{ matrix.binary_name }}" --hidden-import selenium.webdriver.chrome.webdriver --hidden-import selenium.webdriver.chrome.service --hidden-import selenium.webdriver.chrome.options --hidden-import selenium.webdriver.common.by --hidden-import selenium.webdriver.support.ui --hidden-import selenium.webdriver.support.expected_conditions --hidden-import selenium.webdriver.support --hidden-import webdriver_manager.chrome --hidden-import webdriver_manager.core.driver_cache --hidden-import webdriver_manager.core.manager --hidden-import gdown "new_moodle.py"
+          python -m PyInstaller --clean --noconfirm --onefile --console --name "${{ matrix.binary_name }}" --hidden-import selenium.webdriver.chrome.webdriver --hidden-import selenium.webdriver.chrome.service --hidden-import selenium.webdriver.chrome.options --hidden-import selenium.webdriver.common.by --hidden-import selenium.webdriver.support.ui --hidden-import selenium.webdriver.support.expected_conditions --hidden-import selenium.webdriver.support --hidden-import webdriver_manager.chrome --hidden-import webdriver_manager.core.driver_cache --hidden-import webdriver_manager.core.manager --hidden-import gdown "new_things/new_thing.py"
 
       - name: Prepare packaged binary
         shell: bash
@@ -91,4 +99,5 @@ jobs:
           generate_release_notes: true
           files: |
             release/new_thing-windows.exe
-            release/new_thing-macos
+            release/new_thing-macos-intel
+            release/new_thing-macos-arm64
