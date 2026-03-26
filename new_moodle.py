@@ -30,7 +30,7 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import StaleElementReferenceException, SessionNotCreatedException, WebDriverException
+from selenium.common.exceptions import StaleElementReferenceException, SessionNotCreatedException, WebDriverException, TimeoutException
 from selenium.webdriver.chrome.options import Options
 import time
 import tempfile
@@ -550,29 +550,52 @@ def setup_chrome():
     
     # 定義要執行的指令列表
     commands = [
-        ("下載 Chrome DMG", 'curl -L -o /tmp/googlechrome.dmg https://dl.google.com/chrome/mac/universal/stable/GGRO/googlechrome.dmg'),
-        ("驗證 DMG 完整性", 'hdiutil verify /tmp/googlechrome.dmg'),
-        ("移除舊版 Chrome", 'sudo rm -rf "/Applications/Google Chrome.app"'),
-        ("掛載 Chrome DMG", 'hdiutil attach /tmp/googlechrome.dmg -quiet'),
-        ("複製 Chrome 到應用程式資料夾", 'sudo ditto "/Volumes/Google Chrome/Google Chrome.app" "/Applications/Google Chrome.app"'),
-        ("解除 macOS 安全性鎖定", 'sudo xattr -cr "/Applications/Google Chrome.app"'),
+        {
+            "name": "下載 Chrome DMG",
+            "cmd": 'curl --fail --location --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 420 -o /tmp/googlechrome.dmg https://dl.google.com/chrome/mac/universal/stable/GGRO/googlechrome.dmg',
+            "timeout": 480,
+            "retries": 2,
+        },
+        {"name": "驗證 DMG 完整性", "cmd": 'hdiutil verify /tmp/googlechrome.dmg', "timeout": 180, "retries": 1},
+        {"name": "移除舊版 Chrome", "cmd": 'sudo rm -rf "/Applications/Google Chrome.app"', "timeout": 120, "retries": 1},
+        {"name": "掛載 Chrome DMG", "cmd": 'hdiutil attach /tmp/googlechrome.dmg -quiet', "timeout": 180, "retries": 1},
+        {"name": "複製 Chrome 到應用程式資料夾", "cmd": 'sudo ditto "/Volumes/Google Chrome/Google Chrome.app" "/Applications/Google Chrome.app"', "timeout": 240, "retries": 1},
+        {"name": "解除 macOS 安全性鎖定", "cmd": 'sudo xattr -cr "/Applications/Google Chrome.app"', "timeout": 120, "retries": 1},
     ]
-    
-    for step_name, cmd in commands:
-        try:
-            print(f"{BLUE}{step_name}{RESET}", flush=True)
-            result = subprocess.run(cmd, shell=True, check=True, capture_output=True, timeout=120)
-        except subprocess.CalledProcessError as e:
-            print(f"{RED}✗ 失敗{RESET}")
-            print(f"   {RED}錯誤：{e.stderr.decode('utf-8', errors='ignore')}{RESET}")
-            return False
-        except subprocess.TimeoutExpired:
-            print(f"{RED}✗ 超時{RESET}")
-            return False
-        except Exception as e:
-            print(f"{RED}✗ 異常{RESET}")
-            print(f"   {RED}詳情：{e}{RESET}")
-            return False
+
+    for step in commands:
+        step_name = step["name"]
+        cmd = step["cmd"]
+        timeout_sec = step.get("timeout", 120)
+        max_retries = max(1, int(step.get("retries", 1)))
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                print(f"{BLUE}{step_name}{RESET}", flush=True)
+                subprocess.run(cmd, shell=True, check=True, capture_output=True, timeout=timeout_sec)
+                break
+            except subprocess.TimeoutExpired:
+                if attempt < max_retries:
+                    print(f"{YELLOW}! {step_name} 超時，準備重試（{attempt}/{max_retries}）{RESET}")
+                    time.sleep(2)
+                    continue
+                print(f"{RED}✗ 超時{RESET}")
+                print(f"   {RED}步驟：{step_name}（timeout={timeout_sec}s）{RESET}")
+                return False
+            except subprocess.CalledProcessError as e:
+                if attempt < max_retries:
+                    print(f"{YELLOW}! {step_name} 執行失敗，準備重試（{attempt}/{max_retries}）{RESET}")
+                    time.sleep(2)
+                    continue
+                print(f"{RED}✗ 失敗{RESET}")
+                print(f"   {RED}步驟：{step_name}{RESET}")
+                print(f"   {RED}錯誤：{e.stderr.decode('utf-8', errors='ignore')}{RESET}")
+                return False
+            except Exception as e:
+                print(f"{RED}✗ 異常{RESET}")
+                print(f"   {RED}步驟：{step_name}{RESET}")
+                print(f"   {RED}詳情：{e}{RESET}")
+                return False
 
     print(f"{GREEN}Chrome 環境設置完成{RESET}")
 
@@ -1044,10 +1067,53 @@ if not login_success:
     driver.quit()
     sys.exit(1)
 
-wait = WebDriverWait(driver, 10)
-wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.aalink.coursename")))
-course_links = driver.find_elements(By.CSS_SELECTOR, "a.aalink.coursename")
-course_hrefs = [link.get_attribute("href") for link in course_links]
+def snapshot_course_hrefs(driver):
+    """用 JS 快照課程連結，降低前端版型變更造成的定位失敗。"""
+    script = """
+    const nodes = Array.from(document.querySelectorAll("a[href*='/course/view.php?id=']"));
+    const hrefs = nodes
+      .map(a => a.getAttribute('href') || a.href || '')
+      .filter(Boolean)
+      .map(h => h.split('#')[0]);
+    return Array.from(new Set(hrefs));
+    """
+    try:
+        result = driver.execute_script(script)
+        if isinstance(result, list):
+            return [h for h in result if isinstance(h, str) and h.startswith("http")]
+    except Exception:
+        pass
+    return []
+
+course_hrefs = []
+for attempt in range(3):
+    try:
+        # 保險做法：若目前不在「我的課程」，直接導向固定頁面。
+        if "my/courses.php" not in driver.current_url:
+            driver.get("https://elearningv4.nuk.edu.tw/my/courses.php")
+
+        wait = WebDriverWait(driver, 12)
+        select_ongoing_courses_filter(driver, wait)
+        course_hrefs = wait.until(lambda d: snapshot_course_hrefs(d))
+        if course_hrefs:
+            break
+    except TimeoutException:
+        if attempt < 2:
+            continue
+    except Exception:
+        if attempt < 2:
+            continue
+
+if not course_hrefs:
+    print(f"\n{RED}{'='*60}{RESET}")
+    print(f"{RED}X 無法載入課程清單（逾時）{RESET}")
+    print(f"{YELLOW}! 可能是 Moodle 回應較慢或頁面版型變更{RESET}")
+    print(f"{YELLOW}! 請稍後重試，或手動確認『我的課程』頁面是否可正常開啟{RESET}")
+    print(f"{RED}{'='*60}{RESET}")
+    print(f"\n按 Enter 鍵離開...")
+    input()
+    driver.quit()
+    sys.exit(1)
 
 all_output_lines = []
 red_activities_to_print = []  # 暫存紅色活動（(name, link, course_name, week_header, course_path, course_url)）
@@ -1122,7 +1188,14 @@ return (function() {
             if (name && !(name.startsWith('第') && name.endsWith('週')) && name.trim()) {
                 let link = act.querySelector('a.aalink');
                 let href = link ? link.getAttribute('href') : '（無連結）';
-                activities.push({name: name, href: href});
+                
+                let desc = '';
+                let descElem = act.querySelector('.activity-description');
+                if (descElem) {
+                    desc = descElem.innerText || descElem.textContent || '';
+                }
+                
+                activities.push({name: name, href: href, description: desc.trim()});
             }
         });
         
@@ -1268,6 +1341,7 @@ def process_extracted_data(tab_handle, data, href):
         for act_data in section['activities']:
             name = clean_activity_name(act_data['name'])  # 再次確保清理
             href_link = act_data['href']
+            description = act_data.get('description', '')
 
             week_activity_infos.append((name, href_link))
             local_output.append(name)
@@ -1281,7 +1355,7 @@ def process_extracted_data(tab_handle, data, href):
             seen_counts_local[key] += 1
             existing_count = existing_activity_counts.get(key, 0)
             if seen_counts_local[key] > existing_count:
-                local_red_activities.append((name, href_link, course_name, week_header, course_path, href))
+                local_red_activities.append((name, href_link, course_name, week_header, course_path, href, description))
                 # 將 existing_activity_counts 增加以避免同一執行中重複標示同樣的項目
                 existing_activity_counts[key] = existing_count + 1
                 existing_activities.add(name)
@@ -1488,7 +1562,7 @@ def ensure_unique_filename(filepath):
     # 如果 999 個都重複了（不太可能），就直接用原名
     return filepath
         
-def wait_for_download(filename, download_path=None, timeout=300, ask_after=20, size_limit_mb=50):
+def wait_for_download(filename, download_path=None, timeout=300, ask_after=30, size_limit_mb=50):
     """
     等待下載完成。若超過 ask_after 秒或檔案超過 size_limit_mb MB，詢問是否繼續。
     
@@ -1506,6 +1580,35 @@ def wait_for_download(filename, download_path=None, timeout=300, ask_after=20, s
     file_path = os.path.join(download_path, filename)
     cr_path = file_path + ".crdownload"
     start = time.time()
+    expected_root, expected_ext = os.path.splitext(filename)
+
+    def _is_expected_variant(name):
+        root, ext = os.path.splitext(name)
+        if ext != expected_ext:
+            return False
+        if root == expected_root:
+            return True
+        if root.startswith(f"{expected_root} (") and root.endswith(")"):
+            suffix = root[len(expected_root) + 2:-1]
+            return suffix.isdigit()
+        return False
+
+    def _scan_existing_variants():
+        existing = {}
+        try:
+            for name in os.listdir(download_path):
+                if not _is_expected_variant(name):
+                    continue
+                path = os.path.join(download_path, name)
+                try:
+                    existing[path] = os.path.getmtime(path)
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        return existing
+
+    existing_variants = _scan_existing_variants()
 
     已詢問時間 = False
     已詢問大小 = False
@@ -1518,20 +1621,30 @@ def wait_for_download(filename, download_path=None, timeout=300, ask_after=20, s
 
 
     while True:
-        # 檔案存在且無 .crdownload → 檢查是否為新下載的檔案
-        if os.path.exists(file_path) and not os.path.exists(cr_path):
-            # 如果之前檔案就存在,檢查修改時間是否改變
-            if initial_mtime is not None:
-                current_mtime = os.path.getmtime(file_path)
-                if current_mtime <= initial_mtime:
-                    # 檔案沒有更新,繼續等待
-                    time.sleep(0.2)
-                    elapsed = time.time() - start
-                    if elapsed > 5:  # 等待超過5秒還沒新檔案,可能下載到其他地方
-                        return None
+        # 支援 Chrome 自動改名（例如 filename (1).ext），避免誤判下載失敗。
+        completed_candidates = []
+        try:
+            for name in os.listdir(download_path):
+                if not _is_expected_variant(name):
+                    continue
+                candidate_path = os.path.join(download_path, name)
+                candidate_cr = candidate_path + ".crdownload"
+                if os.path.exists(candidate_cr):
+                    continue
+                try:
+                    current_mtime = os.path.getmtime(candidate_path)
+                except OSError:
                     continue
 
-            return file_path
+                previous_mtime = existing_variants.get(candidate_path)
+                if previous_mtime is None or current_mtime > previous_mtime:
+                    completed_candidates.append((current_mtime, candidate_path))
+        except OSError:
+            pass
+
+        if completed_candidates:
+            completed_candidates.sort(key=lambda x: x[0], reverse=True)
+            return completed_candidates[0][1]
 
         elapsed = time.time() - start
 
@@ -1558,16 +1671,24 @@ def wait_for_download(filename, download_path=None, timeout=300, ask_after=20, s
             elif choice == "d":
                 return None
         # 若部分下載的檔案存在 → 第一次建置不詢問，直接跳過大檔案
-        if os.path.exists(file_path) and not 已詢問大小:
-            size_mb = os.path.getsize(file_path) / (1024 * 1024)
-            if size_mb > size_limit_mb:
-                已詢問大小 = True
-                if IS_FIRST_TIME:
-                    return None
-                choice = input(f"檔案超過 {size_limit_mb} MB，要繼續下載嗎？(y/n)：").strip().lower()
-                if choice != "y":
-                    print("⏭️ 使用者選擇跳過。")
-                    return None
+        if not 已詢問大小:
+            try:
+                for name in os.listdir(download_path):
+                    if not _is_expected_variant(name):
+                        continue
+                    current_path = os.path.join(download_path, name)
+                    size_mb = os.path.getsize(current_path) / (1024 * 1024)
+                    if size_mb > size_limit_mb:
+                        已詢問大小 = True
+                        if IS_FIRST_TIME:
+                            return None
+                        choice = input(f"檔案超過 {size_limit_mb} MB，要繼續下載嗎？(y/n)：").strip().lower()
+                        if choice != "y":
+                            print("⏭️ 使用者選擇跳過。")
+                            return None
+                        break
+            except OSError:
+                pass
 
         # 檢查是否超過 timeout
         if elapsed > timeout:
@@ -1590,6 +1711,19 @@ def extract_filename_from_url(url):
         return filename if filename else "unknown_file"
     except:
         return "unknown_file"
+
+def should_skip_download_filename(filename):
+    """硬編碼跳過特定檔名下載（不分副檔名）。"""
+    try:
+        base_name = os.path.basename(filename or "").strip().lower()
+        stem = os.path.splitext(base_name)[0]
+        if stem == "image10":
+            return True
+        if "downloads.htm" in base_name:
+            return True
+        return False
+    except Exception:
+        return False
 
 
 
@@ -1781,7 +1915,10 @@ def try_download_google_drive(gdrive_url, dest_dir, base_name, session):
     m = _re.search(r'spreadsheets/d/([a-zA-Z0-9_-]+)', url)
     if m:
         sid = m.group(1)
-        fp = ensure_unique_filename(os.path.join(dest_dir, f"{base_name}.xlsx"))
+        target_fp = os.path.join(dest_dir, f"{base_name}.xlsx")
+        if os.path.exists(target_fp):
+            return target_fp
+        fp = ensure_unique_filename(target_fp)
         if _export_stream(f"https://docs.google.com/spreadsheets/d/{sid}/export?format=xlsx", fp):
             return fp
         return None
@@ -1790,7 +1927,10 @@ def try_download_google_drive(gdrive_url, dest_dir, base_name, session):
     m = _re.search(r'document/d/([a-zA-Z0-9_-]+)', url)
     if m:
         did = m.group(1)
-        fp = ensure_unique_filename(os.path.join(dest_dir, f"{base_name}.docx"))
+        target_fp = os.path.join(dest_dir, f"{base_name}.docx")
+        if os.path.exists(target_fp):
+            return target_fp
+        fp = ensure_unique_filename(target_fp)
         if _export_stream(f"https://docs.google.com/document/d/{did}/export?format=docx", fp):
             return fp
         return None
@@ -1799,7 +1939,10 @@ def try_download_google_drive(gdrive_url, dest_dir, base_name, session):
     m = _re.search(r'presentation/d/([a-zA-Z0-9_-]+)', url)
     if m:
         pid = m.group(1)
-        fp = ensure_unique_filename(os.path.join(dest_dir, f"{base_name}.pptx"))
+        target_fp = os.path.join(dest_dir, f"{base_name}.pptx")
+        if os.path.exists(target_fp):
+            return target_fp
+        fp = ensure_unique_filename(target_fp)
         if _export_stream(f"https://docs.google.com/presentation/d/{pid}/export?format=pptx", fp):
             return fp
         return None
@@ -1812,7 +1955,7 @@ if red_activities_to_print and not IS_FIRST_TIME and AUTO_OPEN_NEW_ACTIVITY_FOLD
 
     
     opened_folders = set()
-    for name, link, course_name, week_header, course_path, course_url in red_activities_to_print:
+    for name, link, course_name, week_header, course_path, course_url, description in red_activities_to_print:
         if course_path not in opened_folders:
             open_folder(course_path)
             opened_folders.add(course_path)
@@ -1839,10 +1982,24 @@ if red_activities_to_print:
     # 追蹤需要跳過的課程
     skipped_courses = set()
     
-    for name, link, course_name, week_header, course_path, course_url in red_activities_to_print:
+    for name, link, course_name, week_header, course_path, course_url, description in red_activities_to_print:
         # 如果這個課程已被標記為跳過，則跳過
         if course_name in skipped_courses:
             continue
+        
+        # 儲存課程頁卡片上的 activity-description
+        if description and description.strip():
+            safe_desc_name = "".join(c if c.isalnum() or c in " _-()（）" else "_" for c in name).strip()
+            if not safe_desc_name:
+                safe_desc_name = "activity"
+            safe_desc_name = safe_desc_name[:80]
+            desc_file_path = os.path.join(course_path, f"{safe_desc_name}_說明.txt")
+            if not os.path.exists(desc_file_path):
+                try:
+                    with open(desc_file_path, 'w', encoding='utf-8') as df:
+                        df.write(description.strip())
+                except Exception as e:
+                    print(f"{YELLOW}無法儲存活動說明: {e}{RESET}")
         
         # 如果是 URL 類型活動，先獲取實際的外部連結用於顯示
         display_link = link
@@ -1871,11 +2028,15 @@ if red_activities_to_print:
             print(f"{PINK}活動連結：{RESET}{ITALIC}{display_link}{RESET}")
             print(f"{PINK}儲存位置：{RESET}{ITALIC}{course_path}{RESET}\n")
         
-        # 確保每次都重新設定下載路徑到正確的課程資料夾（用於資料夾/作業的 Selenium 下載）
+        # 確保每次都設定下載路徑到專屬暫存資料夾，避免同名檔案直接覆蓋
+        temp_dl_dir = os.path.join(course_path, "_temp_dl")
+        os.makedirs(temp_dl_dir, exist_ok=True)
+        # 移除原有的清空暫存區邏輯，避免把上一次還沒下載完但這次需要接關的檔案刪掉
+
         if hasattr(driver, "execute_cdp_cmd"):
             driver.execute_cdp_cmd("Page.setDownloadBehavior", {
                 "behavior": "allow",
-                "downloadPath": os.path.abspath(course_path)
+                "downloadPath": os.path.abspath(temp_dl_dir)
             })
 
         # 🔽 點進活動頁面，抓取所有有 href 的下載連結並打開（會自動觸發下載）
@@ -1899,6 +2060,8 @@ if red_activities_to_print:
 
                         for img_url in anchors:
                             filename = extract_filename_from_url(img_url)
+                            if should_skip_download_filename(filename):
+                                continue
                             try:
                                 response = session.get(img_url, stream=True)
                                 if response.status_code == 200:
@@ -1919,6 +2082,8 @@ if red_activities_to_print:
                         if not anchors:
                             for img_url in images:
                                 filename = extract_filename_from_url(img_url)
+                                if should_skip_download_filename(filename):
+                                    continue
                                 try:
                                     response = session.get(img_url, stream=True)
                                     if response.status_code == 200:
@@ -1962,9 +2127,9 @@ if red_activities_to_print:
                     
                     # 記錄下載目錄中現有的檔案及其修改時間
                     before_files = {}
-                    if os.path.exists(course_path):
-                        for f in os.listdir(course_path):
-                            fpath = os.path.join(course_path, f)
+                    if os.path.exists(temp_dl_dir):
+                        for f in os.listdir(temp_dl_dir):
+                            fpath = os.path.join(temp_dl_dir, f)
                             if os.path.isfile(fpath):
                                 before_files[f] = os.path.getmtime(fpath)
                     
@@ -1975,6 +2140,8 @@ if red_activities_to_print:
                     if 'pluginfile.php' in driver.current_url:
                         redirect_url = driver.current_url
                         redirect_filename = extract_filename_from_url(redirect_url)
+                        if should_skip_download_filename(redirect_filename):
+                            continue
                         if redirect_filename and not redirect_filename.lower().endswith(('.htm', '.html')):
                             try:
                                 session = create_session_with_cookies()
@@ -1999,9 +2166,9 @@ if red_activities_to_print:
                     # 檢查是否有新檔案出現或檔案被更新（可能是自動下載）
                     time.sleep(0.2)  
                     after_files = {}
-                    if os.path.exists(course_path):
-                        for f in os.listdir(course_path):
-                            fpath = os.path.join(course_path, f)
+                    if os.path.exists(temp_dl_dir):
+                        for f in os.listdir(temp_dl_dir):
+                            fpath = os.path.join(temp_dl_dir, f)
                             if os.path.isfile(fpath):
                                 after_files[f] = os.path.getmtime(fpath)
                     
@@ -2024,15 +2191,27 @@ if red_activities_to_print:
                     
                     if actual_new_files:
                         for filename in actual_new_files:
+                            if should_skip_download_filename(filename):
+                                continue
+                            
+                            temp_file_path = os.path.join(temp_dl_dir, filename)
+                            
                             if filename.lower().endswith(('.htm', '.html')):
-                                file_to_remove = os.path.join(course_path, filename)
                                 try:
-                                    os.remove(file_to_remove)
+                                    os.remove(temp_file_path)
                                 except:
                                     pass
                                 continue
                             
+                            import shutil
+                            # 將檔案移出暫存區並確保檔名不衝突
                             file_path = ensure_unique_filename(os.path.join(course_path, filename))
+                            try:
+                                shutil.move(temp_file_path, file_path)
+                            except Exception as e:
+                                print(f"{RED}X 檔案移動失敗: {e}{RESET}")
+                                continue
+                            
                             files_to_unblock.append(file_path)
                             downloaded_files.add(filename)
                             existing_files.add(filename)
@@ -2048,7 +2227,10 @@ if red_activities_to_print:
 
                                     success = extract_file(file_path, course_path)
                                     if success:
-                                        os.remove(file_path)
+                                        try:
+                                            os.remove(file_path)
+                                        except:
+                                            pass
                                     else:
                                         print(f"   {YELLOW}! 解壓失敗，保留原始檔{RESET}")
                         
@@ -2063,15 +2245,25 @@ if red_activities_to_print:
                             # 等待 .crdownload 完成
                             for cr_file in crdownload_files:
                                 base_filename = cr_file[:-11]  # 移除 .crdownload
+                                if should_skip_download_filename(base_filename):
+                                    continue
                                 # print(f"   ⏳ 等待下載完成: {base_filename}")
-                                file_path = wait_for_download(base_filename, download_path=course_path)
-                                if file_path and file_path != 'SKIP_COURSE':
+                                temp_file_path = wait_for_download(base_filename, download_path=temp_dl_dir)
+                                if temp_file_path and temp_file_path != 'SKIP_COURSE':
                                     if base_filename.lower().endswith(('.htm', '.html')):
-                                        # print(f"   ⏭️  跳過 HTML 文件: {base_filename}")
                                         try:
-                                            os.remove(file_path)
+                                            os.remove(temp_file_path)
                                         except:
                                             pass
+                                        continue
+                                    
+                                    import shutil
+                                    # 將已完成下載的檔案從暫存區移回
+                                    file_path = ensure_unique_filename(os.path.join(course_path, base_filename))
+                                    try:
+                                        shutil.move(temp_file_path, file_path)
+                                    except Exception as e:
+                                        print(f"{RED}X 檔案移動失敗: {e}{RESET}")
                                         continue
                                     
                                     files_to_unblock.append(file_path)
@@ -2086,8 +2278,10 @@ if red_activities_to_print:
 
                                             success = extract_file(file_path, course_path)
                                             if success:
-                                                os.remove(file_path)
-                                                # print(f"   {GREEN}✅ 解壓完成並刪除原始檔{RESET}")
+                                                try:
+                                                    os.remove(file_path)
+                                                except:
+                                                    pass
                             continue
                         
                         # 後備：掃描頁面內嵌的 pluginfile.php 資源（圖片/PDF inline 顯示時）
@@ -2102,6 +2296,8 @@ if red_activities_to_print:
                                 if not res_url:
                                     continue
                                 res_filename = extract_filename_from_url(res_url)
+                                if should_skip_download_filename(res_filename):
+                                    continue
                                 if not res_filename or res_filename.lower().endswith(('.htm', '.html')):
                                     continue
                                 rsp = session.get(res_url, stream=True)
@@ -2121,6 +2317,8 @@ if red_activities_to_print:
                     for link_elem in download_links:
                         dl_href = link_elem.get_attribute("href")
                         filename = extract_filename_from_url(dl_href)
+                        if should_skip_download_filename(filename):
+                            continue
                         # print(f"   📎 發現文件: {filename}")
                         
                         # 過濾掉不需要的文件類型（如 downloads.htm）
@@ -2201,34 +2399,27 @@ if red_activities_to_print:
                 
                 # 首先檢查當前頁面是否是作業頁面,並下載作業說明的附件
                 if "mod/assign/view.php" in link:
-                    # 這是作業頁面,先下載作業說明中的附件
-                    intro_attachments = driver.find_elements(By.CSS_SELECTOR, "div.activity-description a[href*='pluginfile.php']")
-                    for intro_link in intro_attachments:
-                        intro_href = intro_link.get_attribute("href")
-                        filename = extract_filename_from_url(intro_href)
-                        
-                        try:
-
-                            intro_link.click()
-                            wait = WebDriverWait(driver, 5)
-                            file_path = wait_for_download(filename, download_path=course_path)
-                            if file_path == 'SKIP_COURSE':
-                                skipped_courses.add(course_name)
-                                break
-                            if file_path:
-                                files_to_unblock.append(file_path)
-                                downloaded_files.add(filename)
-                                existing_files.add(filename)
-                                total_downloaded_files += 1
-                        except Exception as e:
-                            print(f"{RED}X 下載失敗: {filename}{RESET}")
-                            print(f"   錯誤: {e}")
-                            failed_downloads.append({
-                                'name': name,
-                                'course': course_name,
-                                'url': intro_href,
-                                'filename': filename
-                            })
+                    # 先將作業說明文字存成 txt（包含 activity-description / activity-altcontent）。
+                    try:
+                        description_text = driver.execute_script("""
+                            const targets = Array.from(document.querySelectorAll(
+                                "div.activity-description, div.activity-altcontent.activity-description"
+                            ));
+                            const texts = targets
+                                .map(el => (el.innerText || '').trim())
+                                .filter(Boolean);
+                            return texts.join('\n\n');
+                        """) or ""
+                        if description_text:
+                            safe_desc_name = "".join(c if c.isalnum() or c in " _-()（）" else "_" for c in name).strip()
+                            if not safe_desc_name:
+                                safe_desc_name = "assignment"
+                            safe_desc_name = safe_desc_name[:80]
+                            desc_path = os.path.join(course_path, f"{safe_desc_name}_作業說明.txt")
+                            with open(desc_path, 'w', encoding='utf-8') as df:
+                                df.write(description_text)
+                    except Exception:
+                        pass
                     
                     # 提取作業說明中嵌入的影片連結（例如 YouTube VideoJS）
                     try:
@@ -2265,47 +2456,51 @@ if red_activities_to_print:
                     except Exception as e:
                         print(f"! 無法提取影片連結: {e}")
                 
-                # 找出 submission 區塊內的所有連結（要排除 - 這是已提交的作業）
-                submission_links = set()
-                submission_blocks = driver.find_elements(By.CSS_SELECTOR, "div[class*='summary_assignsubmission_file']")
-                for block in submission_blocks:
-                    a_tags = block.find_elements(By.CSS_SELECTOR, "a[href]")
-                    for a_tag in a_tags:
-                        submission_links.add(a_tag.get_attribute("href"))
+                # 用 JS 一次快照所有需要的連結，避免動態 DOM 造成 stale element。
+                links_snapshot = driver.execute_script("""
+                    const toHrefs = (nodes) => Array.from(nodes)
+                        .map(n => n.getAttribute('href') || n.href || '')
+                        .filter(Boolean);
 
-                # 收集所有 pluginfile.php 連結
+                    const submissionLinks = toHrefs(
+                        document.querySelectorAll("div[class*='summary_assignsubmission_file'] a[href]")
+                    );
+                    const pluginLinks = toHrefs(document.querySelectorAll("a[href*='pluginfile.php']"));
+                    const forceLinks = toHrefs(document.querySelectorAll("a[href*='forcedownload=1']"));
+                    const introAttachmentLinks = toHrefs(
+                        document.querySelectorAll("div.activity-description a[href*='introattachment']")
+                    );
+
+                    return {
+                        submissionLinks,
+                        pluginLinks,
+                        forceLinks,
+                        introAttachmentLinks
+                    };
+                """) or {}
+
+                submission_links = set(links_snapshot.get("submissionLinks", []))
+
+                # 收集所有 pluginfile.php / forcedownload / introattachment 連結
                 file_href_set = set()
-                
-                # 方法1: 找所有包含 pluginfile.php 的連結
-                file_links = driver.find_elements(By.CSS_SELECTOR, "a[href*='pluginfile.php']")
-                # print(f"   找到 {len(file_links)} 個 pluginfile.php 連結")
-                
-                for f in file_links:
-                    f_href = f.get_attribute("href")
-                    # 只排除已提交的檔案
+
+                for f_href in links_snapshot.get("pluginLinks", []):
                     if f_href not in submission_links:
                         file_href_set.add(f_href)
-                        # print(f"   📎 收集連結: {extract_filename_from_url(f_href)}")
-                
-                # 方法2: 特別檢查 forcedownload 參數的連結
-                force_download_links = driver.find_elements(By.CSS_SELECTOR, "a[href*='forcedownload=1']")
-                # print(f"   找到 {len(force_download_links)} 個 forcedownload 連結")
-                
-                for f in force_download_links:
-                    f_href = f.get_attribute("href")
+
+                for f_href in links_snapshot.get("forceLinks", []):
                     if f_href not in submission_links and 'pluginfile.php' in f_href:
                         file_href_set.add(f_href)
-                        # print(f"   📎 收集 forcedownload: {extract_filename_from_url(f_href)}")
-                
-                # 方法3: 檢查作業說明區域
-                intro_attachments = driver.find_elements(By.CSS_SELECTOR, "div.activity-description a[href*='introattachment']")
-                for intro_link in intro_attachments:
-                    file_href_set.add(intro_link.get_attribute("href"))
+
+                for intro_href in links_snapshot.get("introAttachmentLinks", []):
+                    file_href_set.add(intro_href)
                 
                 
                 # 處理收集到的檔案連結
                 for f_href in file_href_set:
                     filename = extract_filename_from_url(f_href)
+                    if should_skip_download_filename(filename):
+                        continue
                     try:
 
                         
@@ -2560,6 +2755,8 @@ if red_activities_to_print:
                         if '/theme_' in pfl_href or '/theme/' in pfl_href:
                             continue
                         pfl_name = extract_filename_from_url(pfl_href)
+                        if should_skip_download_filename(pfl_name):
+                            continue
                         if not pfl_name or pfl_name.lower().endswith(('.htm', '.html')):
                             continue
                         try:
@@ -2616,6 +2813,17 @@ if red_activities_to_print:
             # print(f"{RED}X 處理活動時發生錯誤: {e}{RESET}")
             pass
 
+    # 刪除各課程因下載而產生的暫存資料夾（如果裡面是空的，代表這堂課的所有檔案都處理完成了；如果還有檔案暫存中代表未完成，則保留至下次）
+    for course_path in set(item[4] for item in red_activities_to_print):
+        tmp_dir = os.path.join(course_path, "_temp_dl")
+        if os.path.exists(tmp_dir):
+            try:
+                # 只有資料夾內完全沒有檔案或資料夾時才會被刪除
+                if not os.listdir(tmp_dir):
+                    os.rmdir(tmp_dir)
+            except:
+                pass
+
     # 所有下載完成後，統一移除 Zone.Identifier
     # print(f"\n📊 下載統計：共下載 {total_downloaded_files} 個檔案")
     # print(f"🔍 待解除封鎖的檔案數量：{len(files_to_unblock)}")
@@ -2668,7 +2876,18 @@ if failed_extract and not IS_FIRST_TIME:
     print(f"   或手動下載 UnRAR: https://www.rarlab.com/rar_add.htm")
 
 # 最終保險：確保 Word/PPT/PDF 檔案都已解除封鎖
-unblock_office_files_in_dir(download_dir)
+def _run_unblock_in_background(root_dir):
+    """背景執行檔案解除封鎖，避免阻塞互動提示。"""
+    try:
+        unblock_office_files_in_dir(root_dir)
+    except Exception:
+        pass
+
+threading.Thread(
+    target=_run_unblock_in_background,
+    args=(download_dir,),
+    daemon=True
+).start()
 
 # 按照課程名稱字母順序整理輸出並更新 output.txt
 course_results.sort(key=lambda x: x[1]['course_name'])  # 按課程名稱字母排序
@@ -2862,7 +3081,7 @@ for idx, result in course_results:
 
 # 顯示所有課程（有新活動的用紅色標記）
 red_course_names = set()
-for name, link, course_name, week_header, course_path, course_url in red_activities_to_print:
+for name, link, course_name, week_header, course_path, course_url, description in red_activities_to_print:
     red_course_names.add(course_name)
 ibxx=0
 for idx, (course_name, course_path) in enumerate(all_courses.items(), 1):
