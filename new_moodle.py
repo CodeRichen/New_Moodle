@@ -133,9 +133,21 @@ def should_use_safari_fallback():
 
 def _is_chrome_startup_issue(exc):
     """判斷是否屬於可透過更換 profile 重試的 Chrome 啟動問題。"""
-    msg = str(exc)
-    keywords = ["DevToolsActivePort", "Chrome failed to start", "session not created", "chrome not reachable"]
+    msg = str(exc).lower()
+    keywords = ["devtoolsactiveport", "chrome failed to start", "session not created", "chrome not reachable", "crashed"]
     return any(k in msg for k in keywords)
+
+def _kill_existing_chrome_processes():
+    """殺死現有 Chrome 進程，避免衝突（Windows 專用）"""
+    if os.name != 'nt':
+        return
+    try:
+        import subprocess as _sp
+        _sp.run(["taskkill", "/IM", "chrome.exe", "/F"], 
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=2)
+        time.sleep(0.5)  # 留時間給系統清理資源
+    except Exception:
+        pass
 
 def _prepare_windows_chrome_options(chrome_options):
     """Windows 啟動穩定化：補齊必要參數。"""
@@ -149,14 +161,28 @@ def _prepare_windows_chrome_options(chrome_options):
             chrome_options.add_argument(arg)
             existing_args.add(arg)
 
+    # 遠端調試 port 使用動態分配（避免 DevToolsActivePort 衝突）
     _add_arg("--remote-debugging-port=0")
+    
+    # 基礎穩定化參數
     _add_arg("--disable-gpu")
     _add_arg("--disable-dev-shm-usage")
     _add_arg("--no-sandbox")
-    _add_arg("--disable-features=RendererCodeIntegrity")
     _add_arg("--no-first-run")
     _add_arg("--no-default-browser-check")
-
+    _add_arg("--disable-extensions")
+    _add_arg("--disable-component-update")
+    
+    # 減少記憶體/資源用量，避免進程崩潰
+    _add_arg("--disable-site-isolation-trials")
+    _add_arg("--disable-background-networking")
+    _add_arg("--disable-client-side-phishing-detection")
+    _add_arg("--disable-default-apps")
+    _add_arg("--disable-hang-monitor")
+    _add_arg("--disable-popup-blocking")
+    _add_arg("--disable-prompt-on-repost")
+    _add_arg("--disable-sync")
+    
     return chrome_options
 
 
@@ -196,39 +222,44 @@ def create_webdriver(chrome_options=None, *, hide_windows_console=False):
 
     # Windows 偶發 DevToolsActivePort 問題時，自動換 profile 重試一次。
     if os.name == 'nt':
-        try:
-            return _create_chrome_driver()
-        except WebDriverException as e:
-            if _is_chrome_startup_issue(e):
-                retry_options = Options()
-                if chrome_options is not None:
-                    for arg in chrome_options.arguments:
-                        retry_options.add_argument(arg)
-                    retry_options.page_load_strategy = chrome_options.page_load_strategy
-                    retry_options.binary_location = chrome_options.binary_location
-                    for key, value in chrome_options.experimental_options.items():
-                        retry_options.add_experimental_option(key, value)
-                _prepare_windows_chrome_options(retry_options)
-                try:
-                    return _create_chrome_driver(retry_options)
-                except WebDriverException as second_error:
-                    # 無固定 profile 仍無法啟動時，退回一次臨時 profile 做最後保底。
-                    if _is_chrome_startup_issue(second_error):
-                        fallback_options = Options()
-                        for arg in retry_options.arguments:
-                            if not arg.startswith("--user-data-dir="):
-                                fallback_options.add_argument(arg)
-                        fallback_options.page_load_strategy = retry_options.page_load_strategy
-                        fallback_options.binary_location = retry_options.binary_location
-                        for key, value in retry_options.experimental_options.items():
-                            fallback_options.add_experimental_option(key, value)
-
-                        fallback_dir = tempfile.mkdtemp(prefix="chrome_profile_fallback_", dir=BASE_DOWNLOAD_DIR)
-                        fallback_options.add_argument(f"--user-data-dir={fallback_dir}")
-                        return _create_chrome_driver(fallback_options)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                return _create_chrome_driver()
+            except WebDriverException as e:
+                if _is_chrome_startup_issue(e):
+                    if attempt < max_retries - 1:
+                        print(f"[RETRY {attempt + 1}/{max_retries - 1}] Chrome 啟動失敗，15秒後重試...")
+                        time.sleep(5)  # 等待Chrome進程完全清理
+                        _kill_existing_chrome_processes()
+                        time.sleep(10)  # 再等待一段時間
+                        continue
+                    else:
+                        # 最後一次重試用臨時 profile
+                        retry_options = Options()
+                        if chrome_options is not None:
+                            for arg in chrome_options.arguments:
+                                if not arg.startswith("--user-data-dir="):
+                                    retry_options.add_argument(arg)
+                            retry_options.page_load_strategy = chrome_options.page_load_strategy
+                            if hasattr(chrome_options, 'binary_location'):
+                                retry_options.binary_location = chrome_options.binary_location
+                            for key, value in chrome_options.experimental_options.items():
+                                retry_options.add_experimental_option(key, value)
+                        _prepare_windows_chrome_options(retry_options)
+                        
+                        # 使用臨時 profile 做最後保底
+                        fallback_dir = tempfile.mkdtemp(prefix="chrome_profile_", dir=BASE_DOWNLOAD_DIR)
+                        retry_options.add_argument(f"--user-data-dir={fallback_dir}")
+                        print(f"[FINAL RETRY] 使用臨時 Chrome 配置檔: {fallback_dir}")
+                        try:
+                            return _create_chrome_driver(retry_options)
+                        except WebDriverException as final_error:
+                            print(f"{RED}X Chrome 啟動失敗已達最大重試次數{RESET}")
+                            raise final_error
+                else:
                     raise
-            raise
-
+        
     return _create_chrome_driver()
 
 # 嘗試導入 RAR 解壓工具
@@ -913,23 +944,29 @@ def create_course_folder(course_name):
     os.makedirs(course_path, exist_ok=True)
     return course_path
 
-chrome_options = Options()
+# ========== 在啟動 Chrome 前清理既有進程（Windows 專用） ==========
 if os.name == 'nt':
-    chrome_options.add_argument("--headless=new")  # Windows 較穩定
+    _kill_existing_chrome_processes()
+
+chrome_options = Options()
+
+# 選擇無頭模式：Windows 用傳統 --headless，避免 --headless=new 的不穩定性
+if os.name == 'nt':
+    chrome_options.add_argument("--headless")  # Windows：用傳統無頭模式
 else:
-    chrome_options.add_argument("--headless")  # 無頭模式
+    chrome_options.add_argument("--headless")  # macOS/Linux：無頭模式
+
+# 核心穩定化參數
 chrome_options.add_argument("--disable-gpu")  # 防止顯示錯誤
 chrome_options.add_argument("--log-level=3")  # 降低日誌等級，避免雜訊
 chrome_options.add_argument("--window-size=1920,1080")  # 設定解析度，避免元素渲染錯誤
-chrome_options.add_argument("--disable-extensions")  # 禁用擴充功能
-chrome_options.add_argument("--disable-dev-shm-usage")  # 解決資源限制問題
-chrome_options.add_argument("--no-sandbox")  # 加快啟動速度
 chrome_options.add_argument("--disable-blink-features=AutomationControlled")  # 避免被偵測
+
 # exe優化：減少記憶體使用和加速啟動
 chrome_options.add_argument("--disable-background-timer-throttling")
 chrome_options.add_argument("--disable-backgrounding-occluded-windows")
 chrome_options.add_argument("--disable-renderer-backgrounding")
-chrome_options.add_argument("--disable-features=TranslateUI,VizDisplayCompositor")
+# 移除 TranslateUI,VizDisplayCompositor（可能導致崩潰）
 chrome_options.add_argument("--memory-pressure-off")  # 減少記憶體壓力
 chrome_options.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])  # 避免除錯訊息
 chrome_options.page_load_strategy = 'eager'  # 加快頁面載入速度
