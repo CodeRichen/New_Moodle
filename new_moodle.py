@@ -162,26 +162,21 @@ def _prepare_windows_chrome_options(chrome_options):
             existing_args.add(arg)
 
     # 遠端調試 port 使用動態分配（避免 DevToolsActivePort 衝突）
-    _add_arg("--remote-debugging-port=0")
+    # _add_arg("--remote-debugging-port=0")
     
     # 基礎穩定化參數
     _add_arg("--disable-gpu")
     _add_arg("--disable-dev-shm-usage")
     _add_arg("--no-sandbox")
+    _add_arg("--disable-software-rasterizer")
+    _add_arg("--disable-features=RendererCodeIntegrity")
+    
+    # 新版 Chrome 解決 DevToolsActivePort 找不到的方案
+    _add_arg("--remote-debugging-pipe")
+
     _add_arg("--no-first-run")
     _add_arg("--no-default-browser-check")
     _add_arg("--disable-extensions")
-    _add_arg("--disable-component-update")
-    
-    # 減少記憶體/資源用量，避免進程崩潰
-    _add_arg("--disable-site-isolation-trials")
-    _add_arg("--disable-background-networking")
-    _add_arg("--disable-client-side-phishing-detection")
-    _add_arg("--disable-default-apps")
-    _add_arg("--disable-hang-monitor")
-    _add_arg("--disable-popup-blocking")
-    _add_arg("--disable-prompt-on-repost")
-    _add_arg("--disable-sync")
     
     return chrome_options
 
