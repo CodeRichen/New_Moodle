@@ -326,7 +326,7 @@ BASE_DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "class")
 # ================================================================
 
 # 根據 BASE_DOWNLOAD_DIR 自動設定其他檔案路徑
-OUTPUT_FILE = os.path.join(BASE_DOWNLOAD_DIR, "cless.txt")
+OUTPUT_FILE = os.path.join(BASE_DOWNLOAD_DIR, "class.txt")
 SUBMITTED_ASSIGNMENTS_FILE = os.path.join(BASE_DOWNLOAD_DIR, "submitted_assignments.json")
 PASSWORD_FILE = os.path.join(BASE_DOWNLOAD_DIR, "password.txt")
 BUILDERROR_MARKER = "builderror"
@@ -2845,14 +2845,13 @@ if red_activities_to_print:
             # print(f"{RED}X 處理活動時發生錯誤: {e}{RESET}")
             pass
 
-    # 刪除各課程因下載而產生的暫存資料夾（如果裡面是空的，代表這堂課的所有檔案都處理完成了；如果還有檔案暫存中代表未完成，則保留至下次）
-    for course_path in set(item[4] for item in red_activities_to_print):
-        tmp_dir = os.path.join(course_path, "_temp_dl")
+    # 刪除所有課程因下載而產生的暫存資料夾（確保結束後能清空，複製完成再寫入class.txt）
+    import shutil
+    for idx_res, res in course_results:
+        tmp_dir = os.path.join(create_course_folder(res['course_name']), "_temp_dl")
         if os.path.exists(tmp_dir):
             try:
-                # 只有資料夾內完全沒有檔案或資料夾時才會被刪除
-                if not os.listdir(tmp_dir):
-                    os.rmdir(tmp_dir)
+                shutil.rmtree(tmp_dir)
             except:
                 pass
 
@@ -3035,12 +3034,40 @@ def check_assignments_background():
                             pass
                     
                     if has_submit_button:
+                        # 擷取截止時間
+                        due_date_str = ""
+                        due_date_obj = None
+                        try:
+                            els = driver.find_elements(By.XPATH, "//div[contains(text(), '到期：')] | //div[contains(., '到期：')] | //th[contains(text(), '截止時間')]/following-sibling::td")
+                            for el in els:
+                                text = el.text.strip()
+                                import re
+                                match = re.search(r"到期：\s*(.*?)$", text)
+                                if match:
+                                    due_date_str = match.group(1).strip()
+                                else:
+                                    if "年" in text and "月" in text:
+                                        due_date_str = text
+                                
+                                if due_date_str:
+                                    import datetime
+                                    dt_match = re.search(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日.*\s*(\d{1,2}):(\d{2})", due_date_str)
+                                    if dt_match:
+                                        y, m, d, h, mn = map(int, dt_match.groups())
+                                        due_date_obj = datetime.datetime(y, m, d, h, mn)
+                                    break
+                        except Exception:
+                            pass
+                        
+                        import datetime
                         # 未繳交
                         empty_assignments.append({
                             'name': act_name,
                             'course': course_name,
                             'url': act_href,
-                            'tab_handle': tab_handle
+                            'tab_handle': tab_handle,
+                            'due_date_str': due_date_str,
+                            'due_date_obj': due_date_obj or datetime.datetime.max
                         })
                     else:
                         # 已繳交，加入記錄
@@ -3100,253 +3127,186 @@ if IS_FIRST_TIME:
     cleanup_thread.start()
     close_macos_terminal_and_exit(0)
 
-print(f"{PINK}開啟以下課程的資料夾：{RESET}\n")
+print(f"{PINK}開啟以下課程或未繳交作業（可用空白分隔多個編號）：{RESET}\n")
 
+# 如果作業檢查還沒完成，等待完成
+if not assignment_check_completed:
+    print(f"{YELLOW}正在檢查未繳交作業，請稍候...{RESET}")
+    assignment_check_thread.join()
+
+import datetime
+# 照截止時間排序
+empty_assignments.sort(key=lambda x: x.get('due_date_obj', datetime.datetime.max) if x.get('due_date_obj') else datetime.datetime.max)
+
+items_list = []
 
 # 收集所有課程資料夾（直接使用已有的 course_results 數據）
-all_courses = {}
+all_courses_dict = {}
 for idx, result in course_results:
     course_name = result['course_name']
     course_path = create_course_folder(course_name)
-    if course_name not in all_courses:
-        all_courses[course_name] = course_path
+    if course_name not in all_courses_dict:
+        all_courses_dict[course_name] = course_path
 
 # 顯示所有課程（有新活動的用紅色標記）
 red_course_names = set()
 for name, link, course_name, week_header, course_path, course_url, description in red_activities_to_print:
     red_course_names.add(course_name)
+
 ibxx=0
-for idx, (course_name, course_path) in enumerate(all_courses.items(), 1):
+for idx, (course_name, course_path) in enumerate(all_courses_dict.items(), 1):
+    items_list.append({'type': 'course', 'path': course_path, 'name': course_name})
     if course_name in red_course_names:
-        print(f"  {RED}{idx}. {course_name}{RESET}")
+        print(f"  {RED}{idx}. [課程] {course_name}{RESET}")
     else:
-        if ibxx%2==0:
-            print(f"  {MIKU}{idx}. {course_name}{RESET}")
-        else:
-            print(f"  {BBLUE}{idx}. {course_name}{RESET}")
+        color = MIKU if ibxx%2==0 else BBLUE
+        print(f"  {color}{idx}. [課程] {course_name}{RESET}")
     ibxx += 1
-choice = input(f"\n{PINK}請輸入編號（或輸入 'u' 繳交作業，可用空白分隔多個編號）: {RESET}").strip().lower()
 
+course_count = len(all_courses_dict)
 
-# 如果直接按 Enter（空輸入），立即結束程式
+if empty_assignments:
+    print(f"\n{YELLOW}找到 {len(empty_assignments)} 個未繳交作業：{RESET}")
+    for a_idx, item in enumerate(empty_assignments, 1):
+        idx = course_count + a_idx
+        items_list.append({'type': 'assignment', 'data': item})
+        color = MIKU if ibxx%2==0 else BBLUE
+        due_str = f" (截止: {item['due_date_str']})" if item.get('due_date_str') else ""
+        print(f"  {color}{idx}. [作業] [{item['course']}] {item['name']}{due_str}{RESET}")
+        ibxx += 1
+
+choice = input(f"\n{PINK}請輸入編號: {RESET}").strip().lower()
+
 if not choice:
     close_macos_terminal_and_exit(0)
 
-# 支援空白分隔多個編號
 choice_parts = choice.split()
+selected_courses = []
+selected_assignments = []
 
-if choice == 'u':
-    
-    # 如果作業檢查還沒完成，等待完成
-    if not assignment_check_completed:
-        assignment_check_thread.join()  # 等待背景線程完成
-        print(f"{GREEN}檢查完成！{RESET}\n")
-    
-    if empty_assignments:
-        print(f"\n{YELLOW}找到 {len(empty_assignments)} 個未繳交作業{RESET}")
-        
-        # 列出所有未繳交作業
-        print(f"\n{PINK}完整清單：{RESET}")
-        ibxx=0
-        for idx, item in enumerate(empty_assignments, 1):
-            if ibxx%2==0:
-                print(f" {BBLUE} {idx}. [{item['course']}] {item['name']}{RESET}")
+for part in choice_parts:
+    if part.isdigit():
+        idx = int(part) - 1
+        if 0 <= idx < len(items_list):
+            item = items_list[idx]
+            if item['type'] == 'course':
+                selected_courses.append(item)
             else:
-                print(f" {MIKU} {idx}. [{item['course']}] {item['name']}{RESET}")
-            ibxx += 1
-        
-        # 詢問要開啟哪些作業
-        selection = input(f"{PINK}請輸入要開啟的作業編號（可個用空白分隔): {RESET}").strip().lower()
-        
-        # 按 Enter 直接結束（thread 已在 join 後儲存 submitted_assignments）
-        if not selection:
-            close_macos_terminal_and_exit(0)
-        
-        selected_assignments = []
-        if selection == 'a':
-            selected_assignments = empty_assignments
-        else:
-            indices = [int(x) - 1 for x in selection.split() if x.strip()]
-            selected_assignments = [empty_assignments[i] for i in indices if 0 <= i < len(empty_assignments)]
-        
-        if selected_assignments:
+                selected_assignments.append(item['data'])
 
-            
-            # 關閉 headless driver，改用可見模式
-            driver.quit()
-            
-            # 重新啟動非 headless 模式
-            chrome_options_visible = Options()
-            chrome_options_visible.add_argument("--log-level=3")
-            chrome_options_visible.add_experimental_option("excludeSwitches", ["enable-logging"])
-            chrome_options_visible.add_argument("--disable-gpu")
-            chrome_options_visible.add_argument("--disable-dev-shm-usage")
-            chrome_options_visible.add_argument("--remote-debugging-pipe")
-            chrome_options_visible.add_argument("--disable-software-rasterizer")
-            if os.name == 'nt':
-                chrome_options_visible.add_argument("--no-sandbox")
-                chrome_options_visible.add_argument("--disable-features=RendererCodeIntegrity")
-            apply_chrome_binary_option(chrome_options_visible)
-            try:
-                driver = create_webdriver(chrome_options_visible, hide_windows_console=True)
-            except WebDriverException as e:
-                # Windows 偶發 DevToolsActivePort 啟動失敗：改用臨時 profile 再重試
-                if os.name == 'nt':
-                    time.sleep(1)
-                    chrome_options_visible_retry = Options()
-                    chrome_options_visible_retry.add_argument("--log-level=3")
-                    chrome_options_visible_retry.add_experimental_option("excludeSwitches", ["enable-logging"])
-                    chrome_options_visible_retry.add_argument("--disable-gpu")
-                    chrome_options_visible_retry.add_argument("--disable-dev-shm-usage")
-                    chrome_options_visible_retry.add_argument("--remote-debugging-pipe")
-                    chrome_options_visible_retry.add_argument("--disable-software-rasterizer")
-                    chrome_options_visible_retry.add_argument("--no-sandbox")
-                    chrome_options_visible_retry.add_argument("--disable-features=RendererCodeIntegrity")
-                    submit_fallback_dir = tempfile.mkdtemp(prefix="chrome_profile_submit_fallback_", dir=BASE_DOWNLOAD_DIR)
-                    chrome_options_visible_retry.add_argument(f"--user-data-dir={submit_fallback_dir}")
-                    apply_chrome_binary_option(chrome_options_visible_retry)
-                    driver = create_webdriver(chrome_options_visible_retry, hide_windows_console=True)
-                else:
-                    raise
-            
-            # 重新登入 (與第一次登入完全相同的流程，最多嘗試2次)
-            login_success = False
-            for login_attempt in range(2):
-                try:
-                    driver.get("https://elearningv4.nuk.edu.tw/login/index.php?loginredirect=1")
-                    
-                    WebDriverWait(driver, 10).until(
-                        EC.visibility_of_element_located((By.ID, "username"))
-                    ).send_keys(USERNAME)
-                    
-                    simulate_typing(driver, 'password', PASSWORD)
-                    driver.execute_script("document.getElementById('loginbtn').click();")
-                    
-                    # 等待登入成功（確認導航成功）
-                    time.sleep(0.2)
-                    if "login" not in driver.current_url.lower():
-                        login_success = True
-                        break
-                    else:
-                        if login_attempt == 0:
-                            time.sleep(1)
-                except Exception as e:
-                    if login_attempt == 0:
-                        time.sleep(1)
-            
-            if not login_success:
-                driver.quit()
-                sys.exit()
-
-            
-            # 開啟選中的作業頁面並點擊「繳交作業」按鈕
-            for idx, assignment in enumerate(selected_assignments, 1):
-                
-                # 在新分頁開啟作業
-                if idx == 1:
-                    driver.get(assignment['url'])
-                else:
-                    driver.execute_script(f"window.open('{assignment['url']}', '_blank');")
-                    driver.switch_to.window(driver.window_handles[-1])
-                
-                time.sleep(0.5)
-                
-                # 點擊「繳交作業」按鈕
-                try:
-                    submit_button = WebDriverWait(driver, 5).until(
-                        EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), '繳交作業')]"))
-                    )
-                    submit_button.click()
-                    time.sleep(0.5)
-                except Exception as e:
-                    print(f"   無法點擊按鈕: {e}")
-        
-            
-            # 等待用戶按 Enter 或瀏覽器被關閉
-            enter_pressed = threading.Event()
-            
-            def wait_for_enter():
-                input()
-                enter_pressed.set()
-            
-            input_thread = threading.Thread(target=wait_for_enter, daemon=True)
-            input_thread.start()
-            
-            # 持續檢查瀏覽器狀態或 Enter 鍵
-            while True:
-                try:
-                    # 檢查瀏覽器是否還活著
-                    driver.current_url
-                    # 檢查是否按了 Enter
-                    if enter_pressed.is_set():
-                        break
-                    time.sleep(0.5)
-                except:
-                    # 瀏覽器已被關閉
-                    break
-            
-            try:
-                driver.quit()
-            except:
-                pass
-            sys.exit()
-    
-    # 如果選擇 'u' 但沒有未繳交作業，繼續執行下面的程式碼
-    else:
-        print(f"\n{GREEN}所有作業都已繳交{RESET}")
-        # 沒有作業需要處理，直接結束程式
-        close_macos_terminal_and_exit(0)
-
-elif choice_parts and all(token.isdigit() for token in choice_parts):
+if selected_courses:
     opened = 0
-    for part in choice_parts:
-        idx_num = int(part)
-        if all_courses and 1 <= idx_num <= len(all_courses):
-            selected_course = list(all_courses.keys())[idx_num - 1]
-            selected_path = all_courses[selected_course]
-            open_folder(selected_path)
-            opened += 1
-    if opened == 0:
-        print("輸入無效，未開啟任何資料夾")
-    # 開啟資料夾後立即結束
-    close_macos_terminal_and_exit(0)
+    for c in selected_courses:
+        open_folder(c['path'])
+        opened += 1
 
-# 程式結束前完整清理資源（優化 exe 執行效能）
-def cleanup_resources():
-    """完整清理所有資源，避免 exe 卡頓"""
+if selected_assignments:
+    # 關閉 headless driver，改用可見模式
     try:
-        # 快速關閉 WebDriver，避免網路通信延遲
-        if 'driver' in globals() and driver:
-            # 使用更快速的關閉方式，避免atexit時的網路超時
-            try:
-                driver.service.stop()  # 直接停止服務
-            except:
-                pass
-            try:
-                driver.quit()
-            except:
-                pass
-    except Exception:
+        driver.quit()
+    except:
         pass
     
+    # 重新啟動非 headless 模式
+    chrome_options_visible = Options()
+    chrome_options_visible.add_argument("--log-level=3")
+    chrome_options_visible.add_experimental_option("excludeSwitches", ["enable-logging"])
+    chrome_options_visible.add_argument("--disable-gpu")
+    chrome_options_visible.add_argument("--disable-dev-shm-usage")
+    chrome_options_visible.add_argument("--remote-debugging-pipe")
+    chrome_options_visible.add_argument("--disable-software-rasterizer")
+    if os.name == 'nt':
+        chrome_options_visible.add_argument("--no-sandbox")       
+        chrome_options_visible.add_argument("--disable-features=RendererCodeIntegrity")
+    apply_chrome_binary_option(chrome_options_visible)
     try:
-        # 強制垃圾回收
-        import gc
-        gc.collect()
-    except Exception:
-        pass
+        driver = create_webdriver(chrome_options_visible, hide_windows_console=True)
+    except WebDriverException as e:
+        # Windows 偶發 DevToolsActivePort 啟動失敗：改用臨時 profile 再重試
+        if os.name == 'nt':
+            time.sleep(1)
+            chrome_options_visible_retry = Options()
+            chrome_options_visible_retry.add_argument("--log-level=3")
+            chrome_options_visible_retry.add_experimental_option("excludeSwitches", ["enable-logging"])
+            chrome_options_visible_retry.add_argument("--disable-gpu")
+            chrome_options_visible_retry.add_argument("--disable-dev-shm-usage")
+            chrome_options_visible_retry.add_argument("--remote-debugging-pipe")
+            chrome_options_visible_retry.add_argument("--disable-software-rasterizer")
+            chrome_options_visible_retry.add_argument("--no-sandbox")
+            chrome_options_visible_retry.add_argument("--disable-features=RendererCodeIntegrity")
+            submit_fallback_dir = tempfile.mkdtemp(prefix="chrome_profile_submit_fallback_", dir=BASE_DOWNLOAD_DIR)
+            chrome_options_visible_retry.add_argument(f"--user-data-dir={submit_fallback_dir}")
+            apply_chrome_binary_option(chrome_options_visible_retry)
+            driver = create_webdriver(chrome_options_visible_retry, hide_windows_console=True)
+        else:
+            raise
 
-# 註冊程式退出時的清理函數（僅在非強制退出時執行）
-import atexit
-atexit.register(cleanup_resources)
+    # 重新登入
+    login_success = False
+    for login_attempt in range(2):
+        try:
+            driver.get("https://elearningv4.nuk.edu.tw/login/index.php?loginredirect=1")
+            WebDriverWait(driver, 10).until(
+                EC.visibility_of_element_located((By.ID, "username"))
+            ).send_keys(USERNAME)
+            simulate_typing(driver, 'password', PASSWORD)
+            driver.execute_script("document.getElementById('loginbtn').click();")
+            
+            time.sleep(0.2)
+            if "login" not in driver.current_url.lower():
+                login_success = True
+                break
+            else:
+                if login_attempt == 0:
+                    time.sleep(1)
+        except Exception:
+            if login_attempt == 0:
+                time.sleep(1)
 
-# 額外保險：背景線程清理（保留原有邏輯）
-def cleanup_driver():
-    try:
-        if 'driver' in globals() and driver:
+    if not login_success:
+        try:
             driver.quit()
-    except Exception:
-        pass
+        except:
+            pass
+        sys.exit()
 
-cleanup_thread = threading.Thread(target=cleanup_driver, daemon=True)
-cleanup_thread.start()
+    for idx, assignment in enumerate(selected_assignments, 1):    
+        if idx == 1:
+            driver.get(assignment['url'])
+        else:
+            driver.execute_script(f"window.open(\"{assignment['url']}\", '_blank');")
+            driver.switch_to.window(driver.window_handles[-1])    
+        
+        time.sleep(0.5)
+        try:
+            submit_button = WebDriverWait(driver, 5).until(       
+                EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), '繳交作業')]"))
+            )
+            submit_button.click()
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"   無法點擊按鈕: {e}")
+
+    enter_pressed = threading.Event()
+    def wait_for_enter_bg():
+        input()
+        enter_pressed.set()
+    input_thread = threading.Thread(target=wait_for_enter_bg, daemon=True)
+    input_thread.start()
+
+    while True:
+        try:
+            driver.current_url
+            if enter_pressed.is_set():
+                break
+            time.sleep(0.5)
+        except:
+            break
+
+    try:
+        driver.quit()
+    except:
+        pass
+    sys.exit()
+
+close_macos_terminal_and_exit(0)
