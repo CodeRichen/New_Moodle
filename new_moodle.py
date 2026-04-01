@@ -326,7 +326,7 @@ BASE_DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "class")
 # ================================================================
 
 # 根據 BASE_DOWNLOAD_DIR 自動設定其他檔案路徑
-OUTPUT_FILE = os.path.join(BASE_DOWNLOAD_DIR, "class.txt")
+OUTPUT_FILE = os.path.join(BASE_DOWNLOAD_DIR, "cless.txt")
 SUBMITTED_ASSIGNMENTS_FILE = os.path.join(BASE_DOWNLOAD_DIR, "submitted_assignments.json")
 PASSWORD_FILE = os.path.join(BASE_DOWNLOAD_DIR, "password.txt")
 BUILDERROR_MARKER = "builderror"
@@ -2845,7 +2845,7 @@ if red_activities_to_print:
             # print(f"{RED}X 處理活動時發生錯誤: {e}{RESET}")
             pass
 
-    # 刪除所有課程因下載而產生的暫存資料夾（確保結束後能清空，複製完成再寫入class.txt）
+    # 刪除所有課程因下載而產生的暫存資料夾（確保結束後能清空，複製完成再寫入cless.txt）
     import shutil
     for idx_res, res in course_results:
         tmp_dir = os.path.join(create_course_folder(res['course_name']), "_temp_dl")
@@ -3042,12 +3042,12 @@ def check_assignments_background():
                             for el in els:
                                 text = el.text.strip()
                                 import re
-                                match = re.search(r"到期：\s*(.*?)$", text)
+                                match = re.search(r"到期：\s*([^\n\r]+)", text)
                                 if match:
                                     due_date_str = match.group(1).strip()
                                 else:
                                     if "年" in text and "月" in text:
-                                        due_date_str = text
+                                        due_date_str = text.split('\n')[0].strip()
                                 
                                 if due_date_str:
                                     import datetime
