@@ -3157,7 +3157,6 @@ current_idx = 1
 ibxx = 0
 
 if empty_assignments:
-    print(f"\n{YELLOW}找到 {len(empty_assignments)} 個未繳交作業：{RESET}")
     for item in empty_assignments:
         items_list.append({'type': 'assignment', 'data': item})
         spacing = "  " if current_idx <= 9 else " "
@@ -3167,7 +3166,6 @@ if empty_assignments:
         current_idx += 1
         ibxx += 1
 
-print(f"\n{PINK}課程清單：{RESET}")
 for course_name, course_path in all_courses_dict.items():
     items_list.append({'type': 'course', 'path': course_path, 'name': course_name})
     spacing = "  " if current_idx <= 9 else " "
