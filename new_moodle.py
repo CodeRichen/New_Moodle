@@ -874,6 +874,225 @@ def save_submitted_assignments(submitted_dict):
     except Exception as e:
         print(f"{RED}警告：無法儲存已繳交作業記錄: {e}{RESET}")
 
+
+def check_assignments_background_early(course_hrefs_snapshot, username, password):
+    """用獨立 WebDriver 在程式一開始就背景檢查未繳交作業。
+
+    重要：不要共用主流程的 driver/all_tabs，避免多執行緒搶同一個 WebDriver 造成不穩定。
+    """
+    global empty_assignments, assignment_check_completed
+
+    from urllib.parse import urlparse, parse_qs
+    import datetime
+    import re
+
+    def build_assignment_key(course_name, act_href):
+        assign_id = None
+        try:
+            q = parse_qs(urlparse(act_href).query)
+            assign_id = (q.get('id') or [None])[0]
+        except Exception:
+            assign_id = None
+        if assign_id:
+            return f"{course_name}||id:{assign_id}"
+        return f"{course_name}||url:{act_href}"
+
+    def has_submitted_record(records, course_name, act_href, assignment_key):
+        if assignment_key in records:
+            return True
+        for rec in records.values():
+            if isinstance(rec, dict) and rec.get('course') == course_name and rec.get('url') == act_href:
+                return True
+        return False
+
+    def _parse_due_datetime(due_date_str):
+        if not due_date_str:
+            return None
+        m = re.search(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日.*?(\d{1,2}):(\d{2})", due_date_str)
+        if not m:
+            return None
+        y, mo, d, h, mi = map(int, m.groups())
+        return datetime.datetime(y, mo, d, h, mi)
+
+    def _extract_due_date_str(bg_driver):
+        # 優先從 activity-dates 區塊擷取「到期」那一行（只取單行，避免把整頁文字一起抓進來）
+        try:
+            due = bg_driver.execute_script("""
+                const root = document.querySelector("div.activity-dates[data-region='activity-dates']")
+                          || document.querySelector('div.activity-dates');
+                if (!root) return '';
+                const txt = (root.innerText || '').replace(/\r/g, '');
+                const m = txt.match(/到期：\s*([^\n]+)/);
+                return m ? m[1].trim() : '';
+            """)
+            if isinstance(due, str) and due.strip():
+                return due.strip()
+        except Exception:
+            pass
+
+        # 後備：找包含「到期：」的 div
+        try:
+            els = bg_driver.find_elements(By.XPATH, "//div[contains(., '到期：')] | //th[contains(text(), '截止時間')]/following-sibling::td")
+            for el in els:
+                text = (el.text or '').strip()
+                m = re.search(r"到期：\s*([^\n\r]+)", text)
+                if m:
+                    return m.group(1).strip()
+                if "年" in text and "月" in text:
+                    return text.split('\n')[0].strip()
+        except Exception:
+            pass
+        return ""
+
+    submitted_assignments = load_submitted_assignments()
+    empty_assignments = []
+    newly_submitted = {}
+
+    assignment_check_completed = False
+    bg_driver = None
+
+    try:
+        if os.name == 'nt':
+            _kill_existing_chrome_processes()
+
+        bg_options = Options()
+        bg_options.add_argument("--headless")
+        bg_options.add_argument("--disable-gpu")
+        bg_options.add_argument("--log-level=3")
+        bg_options.add_argument("--window-size=1920,1080")
+        bg_options.add_argument("--disable-blink-features=AutomationControlled")
+        bg_options.add_argument("--disable-background-timer-throttling")
+        bg_options.add_argument("--disable-backgrounding-occluded-windows")
+        bg_options.add_argument("--disable-renderer-backgrounding")
+        bg_options.add_argument("--memory-pressure-off")
+        bg_options.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])
+        bg_options.page_load_strategy = 'eager'
+        apply_chrome_binary_option(bg_options)
+
+        bg_prefs = {
+            "download.default_directory": BASE_DOWNLOAD_DIR,
+            "plugins.always_open_pdf_externally": True,
+            "profile.default_content_setting_values.images": 2,
+            "profile.default_content_setting_values.media_stream": 2,
+            "profile.managed_default_content_settings.images": 2,
+            "profile.default_content_settings.popups": 0,
+        }
+        bg_options.add_experimental_option("prefs", bg_prefs)
+
+        bg_driver = create_webdriver(bg_options, hide_windows_console=True)
+
+        # 登入（避免依賴主流程的 driver）
+        bg_driver.get("https://elearningv4.nuk.edu.tw/login/index.php?loginredirect=1")
+        WebDriverWait(bg_driver, 10).until(
+            EC.visibility_of_element_located((By.ID, "username"))
+        ).send_keys(username)
+        try:
+            pw = bg_driver.find_element(By.ID, "password")
+            pw.clear()
+            pw.send_keys(password)
+        except Exception:
+            # 若被前端改版，退回用 JS
+            bg_driver.execute_script("document.getElementById('password').value = arguments[0];", password)
+        bg_driver.execute_script("document.getElementById('loginbtn').click();")
+        time.sleep(0.2)
+
+        # 開始檢查課程作業
+        for course_href in list(course_hrefs_snapshot or []):
+            try:
+                bg_driver.get(course_href)
+                time.sleep(0.2)
+
+                try:
+                    course_name = bg_driver.find_element(By.CSS_SELECTOR, "h1.h2").text
+                except Exception:
+                    course_name = ""
+
+                assignments_info = bg_driver.execute_script("""
+                    return Array.from(document.querySelectorAll("div.activity-item a.aalink[href*='mod/assign/view.php']"))
+                        .map(a => {
+                            const span = a.querySelector('span.instancename');
+                            return {
+                                href: a.getAttribute('href') || a.href || '',
+                                name: span ? span.textContent : ''
+                            };
+                        })
+                        .filter(x => x.href && x.name);
+                """) or []
+
+                for assign_info in assignments_info:
+                    try:
+                        act_href = assign_info.get('href', '')
+                        act_name = clean_activity_name(assign_info.get('name', ''))
+                        if not act_href or not act_name:
+                            continue
+
+                        assignment_key = build_assignment_key(course_name, act_href)
+                        if has_submitted_record(submitted_assignments, course_name, act_href, assignment_key):
+                            continue
+                        if has_submitted_record(newly_submitted, course_name, act_href, assignment_key):
+                            continue
+
+                        bg_driver.get(act_href)
+                        bg_driver.execute_script("document.body.style.zoom='80%'")
+
+                        has_submit_button = False
+                        try:
+                            WebDriverWait(bg_driver, 1).until(
+                                EC.presence_of_element_located((By.XPATH, "//button[contains(text(), '繳交作業')] | //th[contains(text(), '繳交狀態')]"))
+                            )
+                        except Exception:
+                            pass
+
+                        try:
+                            submit_buttons = bg_driver.find_elements(By.XPATH, "//button[contains(text(), '繳交作業')]")
+                            if submit_buttons:
+                                has_submit_button = True
+                        except Exception:
+                            pass
+
+                        if not has_submit_button:
+                            try:
+                                status_cell = bg_driver.find_element(By.XPATH, "//th[contains(text(), '繳交狀態')]/following-sibling::td")
+                                status_text = status_cell.text
+                                if "尚無任何作業繳交" in status_text or "目前尚無" in status_text:
+                                    has_submit_button = True
+                            except Exception:
+                                pass
+
+                        if has_submit_button:
+                            due_date_str = _extract_due_date_str(bg_driver)
+                            due_dt = _parse_due_datetime(due_date_str) or datetime.datetime.max
+                            empty_assignments.append({
+                                'name': act_name,
+                                'course': course_name,
+                                'url': act_href,
+                                'due_date_str': due_date_str,
+                                'due_date_obj': due_dt,
+                            })
+                        else:
+                            newly_submitted[assignment_key] = {
+                                'course': course_name,
+                                'name': act_name,
+                                'url': act_href,
+                                'assignment_key': assignment_key,
+                                'checked_date': time.strftime('%Y-%m-%d %H:%M:%S')
+                            }
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        if newly_submitted:
+            submitted_assignments.update(newly_submitted)
+        save_submitted_assignments(submitted_assignments)
+    finally:
+        try:
+            if bg_driver is not None:
+                bg_driver.quit()
+        except Exception:
+            pass
+        assignment_check_completed = True
+
 def open_folder(path):
     """開啟檔案總管到指定資料夾"""
     try:
@@ -1146,6 +1365,16 @@ if not course_hrefs:
     input()
     driver.quit()
     sys.exit(1)
+
+# ====== 程式一開始就背景檢查作業（用獨立 WebDriver，不干擾主流程） ======
+empty_assignments = []
+assignment_check_completed = False
+assignment_check_thread = threading.Thread(
+    target=check_assignments_background_early,
+    args=(course_hrefs.copy(), USERNAME, PASSWORD),
+    daemon=True
+)
+assignment_check_thread.start()
 
 all_output_lines = []
 red_activities_to_print = []  # 暫存紅色活動（(name, link, course_name, week_header, course_path, course_url)）
@@ -2929,183 +3158,6 @@ for idx, result in course_results:
 with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
     f.write("\n".join(all_output_lines_sorted))
 
-# 定義背景檢查作業的函數
-def check_assignments_background():
-    global empty_assignments, assignment_check_completed
-    from urllib.parse import urlparse, parse_qs
-
-    def build_assignment_key(course_name, act_href):
-        """用課程 + 作業 id 建立穩定鍵值，避免同名作業互相覆蓋。"""
-        assign_id = None
-        try:
-            q = parse_qs(urlparse(act_href).query)
-            assign_id = (q.get('id') or [None])[0]
-        except Exception:
-            assign_id = None
-
-        if assign_id:
-            return f"{course_name}||id:{assign_id}"
-        return f"{course_name}||url:{act_href}"
-
-    def has_submitted_record(records, course_name, act_href, assignment_key):
-        """同時支援新舊格式：key 命中或同課程同網址視為已繳交。"""
-        if assignment_key in records:
-            return True
-        for rec in records.values():
-            if isinstance(rec, dict) and rec.get('course') == course_name and rec.get('url') == act_href:
-                return True
-        return False
-
-    # 讀取已繳交作業記錄
-    submitted_assignments = load_submitted_assignments()
-    
-    empty_assignments = []
-    newly_submitted = {}  # 記錄新發現已繳交的作業
-    
-    # 使用已開啟的分頁遍歷所有課程
-    for tab_handle in all_tabs:
-        driver.switch_to.window(tab_handle)
-        
-        try:
-            course_name = driver.find_element(By.CSS_SELECTOR, "h1.h2").text
-            course_href = driver.current_url
-        except:
-            continue
-        
-        # 找出所有作業連結
-        try:
-            # 用 JS 一次快照所有作業 href/name，避免 stale element
-            assignments_info = driver.execute_script("""
-                return Array.from(document.querySelectorAll("div.activity-item a.aalink[href*='mod/assign/view.php']"))
-                    .map(a => {
-                        const span = a.querySelector('span.instancename');
-                        return {
-                            href: a.getAttribute('href') || a.href || '',
-                            name: span ? span.textContent : ''
-                        };
-                    })
-                    .filter(x => x.href && x.name);
-            """) or []
-            
-            # 迭代收集到的資訊
-            for assign_info in assignments_info:
-                try:
-                    act_href = assign_info['href']
-                    act_name = assign_info['name']
-                    act_name = clean_activity_name(act_name)
-                    
-                    # 建立唯一識別鍵 (優先使用作業 id)
-                    assignment_key = build_assignment_key(course_name, act_href)
-                    
-                    # 檢查是否在已繳交記錄中
-                    if has_submitted_record(submitted_assignments, course_name, act_href, assignment_key):
-                        continue
-                    if has_submitted_record(newly_submitted, course_name, act_href, assignment_key):
-                        continue
-                    
-                    # 沒有記錄，進入頁面檢查
-                    driver.get(act_href)
-                    wait = WebDriverWait(driver, 5)
-                    driver.execute_script("document.body.style.zoom='80%'")
-                    
-                    # 檢查是否有「繳交作業」按鈕
-                    has_submit_button = False
-                    try:
-                        WebDriverWait(driver, 1).until(
-                            EC.presence_of_element_located((By.XPATH, "//button[contains(text(), '繳交作業')] | //th[contains(text(), '繳交狀態')]"))
-                        )
-                    except:
-                        pass
-                    
-                    try:
-                        submit_buttons = driver.find_elements(By.XPATH, "//button[contains(text(), '繳交作業')]")
-                        if submit_buttons and len(submit_buttons) > 0:
-                            has_submit_button = True
-                    except:
-                        pass
-                    
-                    if not has_submit_button:
-                        try:
-                            status_cell = driver.find_element(By.XPATH, "//th[contains(text(), '繳交狀態')]/following-sibling::td")
-                            status_text = status_cell.text
-                            if "尚無任何作業繳交" in status_text or "目前尚無" in status_text:
-                                has_submit_button = True
-                        except:
-                            pass
-                    
-                    if has_submit_button:
-                        # 擷取截止時間
-                        due_date_str = ""
-                        due_date_obj = None
-                        try:
-                            els = driver.find_elements(By.XPATH, "//div[contains(text(), '到期：')] | //div[contains(., '到期：')] | //th[contains(text(), '截止時間')]/following-sibling::td")
-                            for el in els:
-                                text = el.text.strip()
-                                import re
-                                match = re.search(r"到期：\s*([^\n\r]+)", text)
-                                if match:
-                                    due_date_str = match.group(1).strip()
-                                else:
-                                    if "年" in text and "月" in text:
-                                        due_date_str = text.split('\n')[0].strip()
-                                
-                                if due_date_str:
-                                    import datetime
-                                    dt_match = re.search(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日.*\s*(\d{1,2}):(\d{2})", due_date_str)
-                                    if dt_match:
-                                        y, m, d, h, mn = map(int, dt_match.groups())
-                                        due_date_obj = datetime.datetime(y, m, d, h, mn)
-                                    break
-                        except Exception:
-                            pass
-                        
-                        import datetime
-                        # 未繳交
-                        empty_assignments.append({
-                            'name': act_name,
-                            'course': course_name,
-                            'url': act_href,
-                            'tab_handle': tab_handle,
-                            'due_date_str': due_date_str,
-                            'due_date_obj': due_date_obj or datetime.datetime.max
-                        })
-                    else:
-                        # 已繳交，加入記錄
-                        newly_submitted[assignment_key] = {
-                            'course': course_name,
-                            'name': act_name,
-                            'url': act_href,
-                            'assignment_key': assignment_key,
-                            'checked_date': time.strftime('%Y-%m-%d %H:%M:%S')
-                        }
-                    
-                    driver.back()
-                    time.sleep(0.1)
-                    
-                except Exception as e:
-                    try:
-                        driver.back()
-                    except:
-                        driver.switch_to.window(tab_handle)
-                    time.sleep(0.1)
-                    continue
-        except Exception as e:
-            driver.switch_to.window(tab_handle)
-            continue
-    
-    # 更新已繳交作業記錄（無論有無新增，都儲存以確保檔案存在）
-    if newly_submitted:
-        submitted_assignments.update(newly_submitted)
-    save_submitted_assignments(submitted_assignments)
-    
-    assignment_check_completed = True
-
-# 在背景線程啟動作業檢查
-empty_assignments = []
-assignment_check_completed = False
-assignment_check_thread = threading.Thread(target=check_assignments_background, daemon=True)
-assignment_check_thread.start()
-
 # 在結束前詢問是否要開啟任何課程資料夾
 # 如果是第一次使用，跳過選擇並直接結束
 if IS_FIRST_TIME:
@@ -3131,7 +3183,6 @@ print(f"{PINK}開啟以下課程或未繳交作業（可用空白分隔多個編
 
 # 如果作業檢查還沒完成，等待完成
 if not assignment_check_completed:
-    print(f"{YELLOW}正在檢查未繳交作業，請稍候...{RESET}")
     assignment_check_thread.join()
 
 import datetime
@@ -3162,7 +3213,7 @@ if empty_assignments:
         spacing = "  " if current_idx <= 9 else " "
         color = MIKU if ibxx%2==0 else BBLUE
         due_str = f" (截止: {item['due_date_str']})" if item.get('due_date_str') else ""
-        print(f"  {color}{current_idx}.{spacing}[作業] [{item['course']}] {item['name']}{due_str}{RESET}")
+        print(f"  {color}{current_idx}.{spacing}[作業] [{item['course']}] {item['name']}{RED}{due_str}{RESET}")
         current_idx += 1
         ibxx += 1
 
