@@ -3153,27 +3153,31 @@ red_course_names = set()
 for name, link, course_name, week_header, course_path, course_url, description in red_activities_to_print:
     red_course_names.add(course_name)
 
-ibxx=0
-for idx, (course_name, course_path) in enumerate(all_courses_dict.items(), 1):
-    items_list.append({'type': 'course', 'path': course_path, 'name': course_name})
-    if course_name in red_course_names:
-        print(f"  {RED}{idx}. [課程] {course_name}{RESET}")
-    else:
-        color = MIKU if ibxx%2==0 else BBLUE
-        print(f"  {color}{idx}. [課程] {course_name}{RESET}")
-    ibxx += 1
-
-course_count = len(all_courses_dict)
+current_idx = 1
+ibxx = 0
 
 if empty_assignments:
     print(f"\n{YELLOW}找到 {len(empty_assignments)} 個未繳交作業：{RESET}")
-    for a_idx, item in enumerate(empty_assignments, 1):
-        idx = course_count + a_idx
+    for item in empty_assignments:
         items_list.append({'type': 'assignment', 'data': item})
+        spacing = "  " if current_idx <= 9 else " "
         color = MIKU if ibxx%2==0 else BBLUE
         due_str = f" (截止: {item['due_date_str']})" if item.get('due_date_str') else ""
-        print(f"  {color}{idx}. [作業] [{item['course']}] {item['name']}{due_str}{RESET}")
+        print(f"  {color}{current_idx}.{spacing}[作業] [{item['course']}] {item['name']}{due_str}{RESET}")
+        current_idx += 1
         ibxx += 1
+
+print(f"\n{PINK}課程清單：{RESET}")
+for course_name, course_path in all_courses_dict.items():
+    items_list.append({'type': 'course', 'path': course_path, 'name': course_name})
+    spacing = "  " if current_idx <= 9 else " "
+    if course_name in red_course_names:
+        print(f"  {RED}{current_idx}.{spacing}[課程] {course_name}{RESET}")
+    else:
+        color = MIKU if ibxx%2==0 else BBLUE
+        print(f"  {color}{current_idx}.{spacing}[課程] {course_name}{RESET}")
+    current_idx += 1
+    ibxx += 1
 
 choice = input(f"\n{PINK}請輸入編號: {RESET}").strip().lower()
 
