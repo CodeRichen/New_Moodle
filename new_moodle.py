@@ -26,11 +26,12 @@ os.environ['WDM_LOG_LEVEL'] = '0' # 針對 webdriver-manager 的日誌屏蔽
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  #關閉 TensorFlow 的日誌
 import subprocess
 import platform
+import atexit
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import StaleElementReferenceException, SessionNotCreatedException, WebDriverException, TimeoutException
+from selenium.common.exceptions import StaleElementReferenceException, SessionNotCreatedException, WebDriverException, TimeoutException, InvalidSessionIdException
 from selenium.webdriver.chrome.options import Options
 import time
 import tempfile
@@ -45,6 +46,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
+from urllib.parse import urlparse, parse_qs
 
 # 全域變數儲存 ChromeDriver 路徑，避免重複下載
 _cached_driver_path = None
@@ -325,9 +327,53 @@ else:
 BASE_DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "class")
 # ================================================================
 
+# ========== 下載暫存資料夾清理（確保每次執行結束都會刪除）==========
+_TEMP_DL_DIRS = set()
+
+def _register_temp_dl_dir(path: str) -> None:
+    try:
+        if path:
+            _TEMP_DL_DIRS.add(path)
+    except Exception:
+        pass
+
+def _cleanup_temp_dl_dirs() -> None:
+    """刪除所有課程的 `_temp_dl` 暫存資料夾。
+
+    - 會清理已註冊的資料夾
+    - 也會保底掃描 BASE_DOWNLOAD_DIR 內所有名為 `_temp_dl` 的資料夾
+    """
+    import shutil
+    # 先清理已註冊的（通常較快）
+    try:
+        for p in sorted(_TEMP_DL_DIRS, key=lambda s: len(s or ""), reverse=True):
+            if p and os.path.isdir(p):
+                try:
+                    shutil.rmtree(p)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # 保底：掃描目錄下所有 `_temp_dl`
+    try:
+        for root, dirs, _files in os.walk(BASE_DOWNLOAD_DIR):
+            if "_temp_dl" in dirs:
+                tmp_path = os.path.join(root, "_temp_dl")
+                try:
+                    shutil.rmtree(tmp_path)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+atexit.register(_cleanup_temp_dl_dirs)
+
 # 根據 BASE_DOWNLOAD_DIR 自動設定其他檔案路徑
 OUTPUT_FILE = os.path.join(BASE_DOWNLOAD_DIR, "cless.txt")
 SUBMITTED_ASSIGNMENTS_FILE = os.path.join(BASE_DOWNLOAD_DIR, "submitted_assignments.json")
+PENDING_ASSIGNMENTS_FILE = os.path.join(BASE_DOWNLOAD_DIR, "pending_assignments.txt")
+ASSIGNMENT_CHECK_LIMIT = 12
 PASSWORD_FILE = os.path.join(BASE_DOWNLOAD_DIR, "password.txt")
 BUILDERROR_MARKER = "builderror"
 NONPOP_MARKER = "nonpop"
@@ -874,6 +920,232 @@ def save_submitted_assignments(submitted_dict):
     except Exception as e:
         print(f"{RED}警告：無法儲存已繳交作業記錄: {e}{RESET}")
 
+def build_assignment_key(course_name, act_href):
+    """用 course + assign id/url 產生穩定 key。"""
+    assign_id = None
+    try:
+        q = parse_qs(urlparse(act_href).query)
+        assign_id = (q.get('id') or [None])[0]
+    except Exception:
+        assign_id = None
+    if assign_id:
+        return f"{course_name}||id:{assign_id}"
+    return f"{course_name}||url:{act_href}"
+
+def has_submitted_record(records, course_name, act_href, assignment_key):
+    if assignment_key in records:
+        return True
+    for rec in (records or {}).values():
+        if isinstance(rec, dict) and rec.get('course') == course_name and rec.get('url') == act_href:
+            return True
+    return False
+
+def parse_due_datetime(due_date_str):
+    """解析 '2026年 4月 2日 ... 23:59' 類型時間；失敗回傳 None。"""
+    import re
+    import datetime
+    if not due_date_str:
+        return None
+    m = re.search(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日.*?(\d{1,2}):(\d{2})", due_date_str)
+    if not m:
+        return None
+    y, mo, d, h, mi = map(int, m.groups())
+    return datetime.datetime(y, mo, d, h, mi)
+
+def extract_due_date_str(driver_obj):
+    """只取『到期』那一行，避免整頁文字污染。"""
+    import re
+    # 優先從 activity-dates 擷取
+    try:
+        due = driver_obj.execute_script("""
+            const root = document.querySelector("div.activity-dates[data-region='activity-dates']")
+                      || document.querySelector('div.activity-dates');
+            if (!root) return '';
+            const txt = (root.innerText || '').replace(/\r/g, '');
+            const m = txt.match(/到期：\s*([^\n]+)/);
+            return m ? m[1].trim() : '';
+        """)
+        if isinstance(due, str) and due.strip():
+            return due.strip()
+    except Exception:
+        pass
+
+    # 後備：找包含『到期』的區塊
+    try:
+        els = driver_obj.find_elements(By.XPATH, "//div[contains(., '到期：')] | //th[contains(text(), '截止時間')]/following-sibling::td")
+        for el in els:
+            text = (el.text or '').strip()
+            m = re.search(r"到期：\s*([^\n\r]+)", text)
+            if m:
+                return m.group(1).strip()
+            if "年" in text and "月" in text:
+                return text.split('\n')[0].strip()
+    except Exception:
+        pass
+    return ""
+
+def load_pending_assignments():
+    """讀取待繳作業快取文字檔。
+
+    格式：course\tname\tdue_date_str\turl
+    """
+    pending = {}
+    try:
+        if not os.path.exists(PENDING_ASSIGNMENTS_FILE):
+            return {}
+        with open(PENDING_ASSIGNMENTS_FILE, 'r', encoding='utf-8') as f:
+            for raw in f:
+                line = (raw or '').rstrip('\n')
+                if not line.strip():
+                    continue
+                parts = line.split('\t')
+                if len(parts) < 4:
+                    continue
+                course, name, due_date_str, url = parts[0], parts[1], parts[2], parts[3]
+                key = build_assignment_key(course, url)
+                pending[key] = {
+                    'course': course,
+                    'name': name,
+                    'url': url,
+                    'due_date_str': due_date_str,
+                    'due_date_obj': parse_due_datetime(due_date_str) or __import__('datetime').datetime.max,
+                }
+    except Exception:
+        return {}
+    return pending
+
+def save_pending_assignments(pending_dict):
+    try:
+        lines = []
+        for key, item in (pending_dict or {}).items():
+            course = (item.get('course') or '').strip()
+            name = (item.get('name') or '').strip()
+            due = (item.get('due_date_str') or '').strip()
+            url = (item.get('url') or '').strip()
+            if not course or not name or not url:
+                continue
+            lines.append(f"{course}\t{name}\t{due}\t{url}")
+        with open(PENDING_ASSIGNMENTS_FILE, 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines))
+    except Exception:
+        pass
+
+def is_expired_assignment(item, now_dt):
+    try:
+        import datetime
+        due_dt = item.get('due_date_obj')
+        if not due_dt or due_dt == datetime.datetime.max:
+            return False
+        return due_dt < now_dt
+    except Exception:
+        return False
+
+def check_assignments_inline(driver_obj, assignments, *, submitted_assignments, pending_cache, limit=ASSIGNMENT_CHECK_LIMIT):
+    """使用主 driver 限量檢查作業狀態（不額外開新分頁/新 driver）。
+
+    - 已在 submitted / pending_cache 內的會跳過
+    - 檢查到未繳交：寫入 pending_cache
+    - 檢查到已繳交：寫入 submitted_assignments 並從 pending_cache 移除
+    """
+    import datetime
+    newly_submitted = {}
+    checked = 0
+    now_dt = datetime.datetime.now()
+
+    # 去重 + 依原順序
+    seen_keys = set()
+    candidates = []
+    for a in assignments or []:
+        course = a.get('course') or ''
+        url = a.get('url') or ''
+        name = a.get('name') or ''
+        if not course or not url or not name:
+            continue
+        key = build_assignment_key(course, url)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        if key in (pending_cache or {}):
+            continue
+        if has_submitted_record(submitted_assignments, course, url, key):
+            continue
+        candidates.append((key, a))
+
+    for key, a in candidates:
+        if checked >= max(0, int(limit or 0)):
+            break
+        try:
+            driver_obj.get(a['url'])
+            time.sleep(0.2)
+
+            status_text = ""
+            try:
+                status_cell = driver_obj.find_element(By.XPATH, "//th[contains(text(), '繳交狀態')]/following-sibling::td")
+                status_text = (status_cell.text or '').strip()
+            except Exception:
+                status_text = ""
+
+            # 已繳交判斷
+            if status_text and any(k in status_text for k in ["已繳交", "已提交", "已送出"]):
+                newly_submitted[key] = {
+                    'course': a['course'],
+                    'name': a['name'],
+                    'url': a['url'],
+                    'assignment_key': key,
+                    'checked_date': time.strftime('%Y-%m-%d %H:%M:%S')
+                }
+                if key in pending_cache:
+                    pending_cache.pop(key, None)
+                checked += 1
+                continue
+
+            # 是否可繳交（或尚無繳交）
+            has_submit_button = False
+            try:
+                submit_buttons = driver_obj.find_elements(By.XPATH, "//button[contains(text(), '繳交作業')]")
+                if submit_buttons:
+                    has_submit_button = True
+            except Exception:
+                pass
+
+            if not has_submit_button:
+                if status_text and ("尚無任何作業繳交" in status_text or "目前尚無" in status_text):
+                    has_submit_button = True
+
+            if has_submit_button:
+                due_date_str = extract_due_date_str(driver_obj)
+                due_dt = parse_due_datetime(due_date_str) or datetime.datetime.max
+                item = {
+                    'course': a['course'],
+                    'name': a['name'],
+                    'url': a['url'],
+                    'due_date_str': due_date_str,
+                    'due_date_obj': due_dt,
+                }
+                # 過期的不進 pending（也不顯示）
+                if not is_expired_assignment(item, now_dt):
+                    pending_cache[key] = item
+            else:
+                # 沒看到繳交按鈕也沒明確狀態：當作已繳交/無需繳交，避免一直卡在 pending
+                newly_submitted[key] = {
+                    'course': a['course'],
+                    'name': a['name'],
+                    'url': a['url'],
+                    'assignment_key': key,
+                    'checked_date': time.strftime('%Y-%m-%d %H:%M:%S')
+                }
+                if key in pending_cache:
+                    pending_cache.pop(key, None)
+
+            checked += 1
+        except Exception:
+            checked += 1
+            continue
+
+    if newly_submitted:
+        submitted_assignments.update(newly_submitted)
+    return submitted_assignments, pending_cache
+
 
 def check_assignments_background_early(course_hrefs_snapshot, username, password):
     """用獨立 WebDriver 在程式一開始就背景檢查未繳交作業。
@@ -882,67 +1154,8 @@ def check_assignments_background_early(course_hrefs_snapshot, username, password
     """
     global empty_assignments, assignment_check_completed
 
-    from urllib.parse import urlparse, parse_qs
     import datetime
     import re
-
-    def build_assignment_key(course_name, act_href):
-        assign_id = None
-        try:
-            q = parse_qs(urlparse(act_href).query)
-            assign_id = (q.get('id') or [None])[0]
-        except Exception:
-            assign_id = None
-        if assign_id:
-            return f"{course_name}||id:{assign_id}"
-        return f"{course_name}||url:{act_href}"
-
-    def has_submitted_record(records, course_name, act_href, assignment_key):
-        if assignment_key in records:
-            return True
-        for rec in records.values():
-            if isinstance(rec, dict) and rec.get('course') == course_name and rec.get('url') == act_href:
-                return True
-        return False
-
-    def _parse_due_datetime(due_date_str):
-        if not due_date_str:
-            return None
-        m = re.search(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日.*?(\d{1,2}):(\d{2})", due_date_str)
-        if not m:
-            return None
-        y, mo, d, h, mi = map(int, m.groups())
-        return datetime.datetime(y, mo, d, h, mi)
-
-    def _extract_due_date_str(bg_driver):
-        # 優先從 activity-dates 區塊擷取「到期」那一行（只取單行，避免把整頁文字一起抓進來）
-        try:
-            due = bg_driver.execute_script("""
-                const root = document.querySelector("div.activity-dates[data-region='activity-dates']")
-                          || document.querySelector('div.activity-dates');
-                if (!root) return '';
-                const txt = (root.innerText || '').replace(/\r/g, '');
-                const m = txt.match(/到期：\s*([^\n]+)/);
-                return m ? m[1].trim() : '';
-            """)
-            if isinstance(due, str) and due.strip():
-                return due.strip()
-        except Exception:
-            pass
-
-        # 後備：找包含「到期：」的 div
-        try:
-            els = bg_driver.find_elements(By.XPATH, "//div[contains(., '到期：')] | //th[contains(text(), '截止時間')]/following-sibling::td")
-            for el in els:
-                text = (el.text or '').strip()
-                m = re.search(r"到期：\s*([^\n\r]+)", text)
-                if m:
-                    return m.group(1).strip()
-                if "年" in text and "月" in text:
-                    return text.split('\n')[0].strip()
-        except Exception:
-            pass
-        return ""
 
     submitted_assignments = load_submitted_assignments()
     empty_assignments = []
@@ -1060,8 +1273,8 @@ def check_assignments_background_early(course_hrefs_snapshot, username, password
                                 pass
 
                         if has_submit_button:
-                            due_date_str = _extract_due_date_str(bg_driver)
-                            due_dt = _parse_due_datetime(due_date_str) or datetime.datetime.max
+                            due_date_str = extract_due_date_str(bg_driver)
+                            due_dt = parse_due_datetime(due_date_str) or datetime.datetime.max
                             empty_assignments.append({
                                 'name': act_name,
                                 'course': course_name,
@@ -1121,6 +1334,11 @@ def close_macos_terminal_and_exit(code=0):
             )
         except Exception:
             pass
+    # os._exit 會跳過 atexit，故先清理暫存下載資料夾
+    try:
+        _cleanup_temp_dl_dirs()
+    except Exception:
+        pass
     os._exit(code)
 
 # 載入舊活動名稱（改為解析為課程+活動 次數）
@@ -1234,6 +1452,71 @@ def login_to_moodle(driver):
     simulate_typing(driver, 'password', PASSWORD)
     driver.execute_script("document.getElementById('loginbtn').click();")
     time.sleep(0.2)  # 減少等待時間
+
+def _relogin_best_effort(driver) -> bool:
+    """主 driver 斷線重建後的輕量重新登入流程（不直接 sys.exit）。"""
+    for _attempt in range(2):
+        try:
+            login_to_moodle(driver)
+            wait_local = WebDriverWait(driver, 5)
+            my_courses_link = wait_local.until(
+                EC.presence_of_element_located((By.PARTIAL_LINK_TEXT, "我的課程"))
+            )
+            my_courses_link.click()
+            time.sleep(0.2)
+            select_ongoing_courses_filter(driver, wait_local)
+            if "login" not in (driver.current_url or ""):
+                return True
+        except Exception:
+            continue
+    return False
+
+def _recreate_main_driver_or_raise():
+    """重建主 driver，並嘗試重新登入。"""
+    global driver
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    driver = create_webdriver(chrome_options, hide_windows_console=True)
+    if not _relogin_best_effort(driver):
+        raise RuntimeError("重新登入失敗（主瀏覽器已重建）。")
+    return driver
+
+def _open_course_tabs_with_retry(course_hrefs_list):
+    """預先開啟所有課程分頁；遇到斷線/InvalidSessionId 會重建 driver 後重試。"""
+    global driver
+    max_attempts = 3
+    last_exc = None
+    for attempt in range(max_attempts):
+        try:
+            main_handle = driver.current_window_handle
+            for idx, href in enumerate(course_hrefs_list, 1):
+                if idx == 1:
+                    driver.get(href)
+                else:
+                    driver.execute_script("window.open(arguments[0], '_blank');", href)
+                time.sleep(0.05)
+            return main_handle, driver.window_handles
+        except (InvalidSessionIdException, WebDriverException) as e:
+            last_exc = e
+            msg = (str(e) or "").lower()
+            should_retry = (
+                "invalid session" in msg
+                or "session deleted" in msg
+                or "disconnected" in msg
+                or "unable to receive message from renderer" in msg
+            )
+            if attempt < max_attempts - 1 and should_retry:
+                try:
+                    _recreate_main_driver_or_raise()
+                except Exception:
+                    time.sleep(0.5)
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("開啟課程分頁失敗（未知原因）。")
 
 def select_ongoing_courses_filter(driver, wait):
     """進入我的課程後，切換分組到「進行中」（TODO:若要下載全部則 Ctrl+h 將"進行中"取代為"過去"）"""
@@ -1366,15 +1649,8 @@ if not course_hrefs:
     driver.quit()
     sys.exit(1)
 
-# ====== 程式一開始就背景檢查作業（用獨立 WebDriver，不干擾主流程） ======
+# ====== 作業檢查：改為併入主流程（不再額外開新 driver / 新分頁） ======
 empty_assignments = []
-assignment_check_completed = False
-assignment_check_thread = threading.Thread(
-    target=check_assignments_background_early,
-    args=(course_hrefs.copy(), USERNAME, PASSWORD),
-    daemon=True
-)
-assignment_check_thread.start()
 
 all_output_lines = []
 red_activities_to_print = []  # 暫存紅色活動（(name, link, course_name, week_header, course_path, course_url)）
@@ -1385,18 +1661,7 @@ output_lock = threading.Lock()
 data_lock = threading.Lock()
 
 # 預先為所有課程開啟分頁
-main_window = driver.current_window_handle  # 保存主視窗
-
-for idx, href in enumerate(course_hrefs, 1):
-    if idx == 1:
-        # 第一個課程直接在當前分頁載入
-        driver.get(href)
-    else:
-        # 其他課程開新分頁
-        driver.execute_script(f"window.open('{href}', '_blank');")
-
-# 獲取所有分頁的 handle
-all_tabs = driver.window_handles
+main_window, all_tabs = _open_course_tabs_with_retry(course_hrefs)
 
 # 在所有分頁中注入 JavaScript 開始數據提取
 extraction_script = """
@@ -1492,6 +1757,7 @@ def process_extracted_data(tab_handle, data, href):
     
     local_output = []
     local_red_activities = []
+    local_assignments = []  # (course, name, url)
     from collections import defaultdict as _dd
 
     # 記錄在本次執行中每個 (course, activity) 已遇到的次數
@@ -1604,6 +1870,14 @@ def process_extracted_data(tab_handle, data, href):
             href_link = act_data['href']
             description = act_data.get('description', '')
 
+            # 收集作業連結（不額外開頁，只做清單）
+            if isinstance(href_link, str) and 'mod/assign/view.php' in href_link:
+                local_assignments.append({
+                    'course': course_name,
+                    'name': name,
+                    'url': href_link,
+                })
+
             week_activity_infos.append((name, href_link))
             local_output.append(name)
             
@@ -1656,6 +1930,7 @@ def process_extracted_data(tab_handle, data, href):
         'course_name': course_name,
         'output': local_output,
         'red_activities': local_red_activities,
+        'assignments': local_assignments,
         'latest_with_content': latest_with_content,
         'current_week_info': current_week_info,
         'next_week_info': next_week_info,
@@ -2210,8 +2485,8 @@ def try_download_google_drive(gdrive_url, dest_dir, base_name, session):
 
     return None
 
-    # 🔴 先自動開啟所有紅色課程的資料夾
-if red_activities_to_print and not IS_FIRST_TIME and AUTO_OPEN_NEW_ACTIVITY_FOLDERS:
+    # 🔴 先自動開啟所有紅色課程的資料夾（已停用：不再自動開資料夾）
+if False and red_activities_to_print and not IS_FIRST_TIME and AUTO_OPEN_NEW_ACTIVITY_FOLDERS:
    
 
     
@@ -2292,6 +2567,7 @@ if red_activities_to_print:
         # 確保每次都設定下載路徑到專屬暫存資料夾，避免同名檔案直接覆蓋
         temp_dl_dir = os.path.join(course_path, "_temp_dl")
         os.makedirs(temp_dl_dir, exist_ok=True)
+        _register_temp_dl_dir(temp_dl_dir)
         # 移除原有的清空暫存區邏輯，避免把上一次還沒下載完但這次需要接關的檔案刪掉
 
         if hasattr(driver, "execute_cdp_cmd"):
@@ -3074,15 +3350,8 @@ if red_activities_to_print:
             # print(f"{RED}X 處理活動時發生錯誤: {e}{RESET}")
             pass
 
-    # 刪除所有課程因下載而產生的暫存資料夾（確保結束後能清空，複製完成再寫入cless.txt）
-    import shutil
-    for idx_res, res in course_results:
-        tmp_dir = os.path.join(create_course_folder(res['course_name']), "_temp_dl")
-        if os.path.exists(tmp_dir):
-            try:
-                shutil.rmtree(tmp_dir)
-            except:
-                pass
+    # 刪除所有課程因下載而產生的暫存資料夾（確保結束後能清空）
+    _cleanup_temp_dl_dirs()
 
     # 所有下載完成後，統一移除 Zone.Identifier
     # print(f"\n📊 下載統計：共下載 {total_downloaded_files} 個檔案")
@@ -3158,8 +3427,7 @@ for idx, result in course_results:
 with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
     f.write("\n".join(all_output_lines_sorted))
 
-# 在結束前詢問是否要開啟任何課程資料夾
-# 如果是第一次使用，跳過選擇並直接結束
+# 如果是第一次使用，跳過互動選單並直接結束
 if IS_FIRST_TIME:
     clear_builderror_marker(USERNAME, PASSWORD)
     print(f"\n{GREEN}環境建置完成{RESET}")
@@ -3179,31 +3447,45 @@ if IS_FIRST_TIME:
     cleanup_thread.start()
     close_macos_terminal_and_exit(0)
 
-print(f"{PINK}開啟以下課程或未繳交作業（可用空白分隔多個編號）：{RESET}\n")
-
-# 如果作業檢查還沒完成，等待完成
-if not assignment_check_completed:
-    assignment_check_thread.join()
+print(f"{PINK}開啟未繳交作業（可用空白分隔多個編號）：{RESET}\n")
 
 import datetime
-# 照截止時間排序
+
+# 1) 從文字檔載入上次未繳交作業（加速）
+submitted_assignments = load_submitted_assignments()
+pending_cache = load_pending_assignments()
+
+# 清掉已過期（不顯示）
+_now_dt = datetime.datetime.now()
+pending_cache = {k: v for k, v in pending_cache.items() if not is_expired_assignment(v, _now_dt)}
+
+# 2) 從本次「最新消息」抓到的課程頁資料中拿到作業清單（不額外開分頁）
+all_assignments_found = []
+for _idx, _res in course_results:
+    for a in (_res.get('assignments') or []):
+        if isinstance(a, dict) and a.get('url') and a.get('name'):
+            all_assignments_found.append(a)
+
+# 3) 限量檢查新作業（不在 pending/submitted 的），用主 driver 直接進入頁面判斷
+try:
+    submitted_assignments, pending_cache = check_assignments_inline(
+        driver,
+        all_assignments_found,
+        submitted_assignments=submitted_assignments,
+        pending_cache=pending_cache,
+        limit=ASSIGNMENT_CHECK_LIMIT
+    )
+    save_submitted_assignments(submitted_assignments)
+except Exception:
+    # 檢查失敗不阻擋主流程
+    pass
+
+# 4) 組出要顯示的未繳作業清單（只顯示未過期）
+empty_assignments = list(pending_cache.values())
+empty_assignments = [a for a in empty_assignments if not is_expired_assignment(a, _now_dt)]
 empty_assignments.sort(key=lambda x: x.get('due_date_obj', datetime.datetime.max) if x.get('due_date_obj') else datetime.datetime.max)
 
 items_list = []
-
-# 收集所有課程資料夾（直接使用已有的 course_results 數據）
-all_courses_dict = {}
-for idx, result in course_results:
-    course_name = result['course_name']
-    course_path = create_course_folder(course_name)
-    if course_name not in all_courses_dict:
-        all_courses_dict[course_name] = course_path
-
-# 顯示所有課程（有新活動的用紅色標記）
-red_course_names = set()
-for name, link, course_name, week_header, course_path, course_url, description in red_activities_to_print:
-    red_course_names.add(course_name)
-
 current_idx = 1
 ibxx = 0
 
@@ -3211,22 +3493,14 @@ if empty_assignments:
     for item in empty_assignments:
         items_list.append({'type': 'assignment', 'data': item})
         spacing = "  " if current_idx <= 9 else " "
-        color = MIKU if ibxx%2==0 else BBLUE
+        color = MIKU if ibxx % 2 == 0 else BBLUE
         due_str = f" (截止: {item['due_date_str']})" if item.get('due_date_str') else ""
-        print(f"  {color}{current_idx}.{spacing}[作業] [{item['course']}] {item['name']}{RED}{due_str}{RESET}")
+        print(f"  {color}{current_idx}.{spacing}{item['name']}{RED}{due_str}{RESET}")
         current_idx += 1
         ibxx += 1
 
-for course_name, course_path in all_courses_dict.items():
-    items_list.append({'type': 'course', 'path': course_path, 'name': course_name})
-    spacing = "  " if current_idx <= 9 else " "
-    if course_name in red_course_names:
-        print(f"  {RED}{current_idx}.{spacing}[課程] {course_name}{RESET}")
-    else:
-        color = MIKU if ibxx%2==0 else BBLUE
-        print(f"  {color}{current_idx}.{spacing}[課程] {course_name}{RESET}")
-    current_idx += 1
-    ibxx += 1
+# 5) 輸出完後，把不符合規定（未繳交且未過期）的作業寫回文字檔
+save_pending_assignments(pending_cache)
 
 choice = input(f"\n{PINK}請輸入編號: {RESET}").strip().lower()
 
@@ -3234,7 +3508,6 @@ if not choice:
     close_macos_terminal_and_exit(0)
 
 choice_parts = choice.split()
-selected_courses = []
 selected_assignments = []
 
 for part in choice_parts:
@@ -3242,16 +3515,7 @@ for part in choice_parts:
         idx = int(part) - 1
         if 0 <= idx < len(items_list):
             item = items_list[idx]
-            if item['type'] == 'course':
-                selected_courses.append(item)
-            else:
-                selected_assignments.append(item['data'])
-
-if selected_courses:
-    opened = 0
-    for c in selected_courses:
-        open_folder(c['path'])
-        opened += 1
+            selected_assignments.append(item['data'])
 
 if selected_assignments:
     # 關閉 headless driver，改用可見模式
@@ -3331,14 +3595,31 @@ if selected_assignments:
             driver.switch_to.window(driver.window_handles[-1])    
         
         time.sleep(0.5)
+
+        # 若已繳交（或老師允許重複繳交），不強制點「繳交作業」；只要能打開頁面並顯示狀態即可。
         try:
-            submit_button = WebDriverWait(driver, 5).until(       
+            status_text = ""
+            try:
+                status_cell = driver.find_element(By.XPATH, "//th[contains(text(), '繳交狀態')]/following-sibling::td")
+                status_text = (status_cell.text or "").strip()
+            except Exception:
+                status_text = ""
+
+            if status_text:
+                # 常見：已繳交作業 / 已繳交 / 已提交
+                if any(k in status_text for k in ["已繳交", "已提交", "已送出"]):
+                    print(f"  {GREEN}✓ 已繳交{RESET} [{assignment.get('course','')}] {assignment.get('name','')}")
+                    continue
+
+            # 仍可嘗試點擊「繳交作業」按鈕（未繳交時）
+            submit_button = WebDriverWait(driver, 5).until(
                 EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), '繳交作業')]"))
             )
             submit_button.click()
             time.sleep(0.5)
-        except Exception as e:
-            print(f"   無法點擊按鈕: {e}")
+        except Exception:
+            # 不阻擋：保持頁面已開啟即可
+            print(f"  {YELLOW}! 無法進入繳交介面（可能已繳交或版面不同），但已開啟作業頁面{RESET}")
 
     enter_pressed = threading.Event()
     def wait_for_enter_bg():
