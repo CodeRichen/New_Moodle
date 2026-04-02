@@ -27,6 +27,9 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  #關閉 TensorFlow 的日誌
 import subprocess
 import platform
 import atexit
+import urllib.parse
+import http.server
+import socketserver
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -330,6 +333,212 @@ BASE_DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "class")
 # ========== 下載暫存資料夾清理（確保每次執行結束都會刪除）==========
 _TEMP_DL_DIRS = set()
 
+# ========== 模擬瀏覽器（點本機連結自動登入並開啟活動）==========
+_SIM_SERVER = None
+_SIM_BASE_URL = None
+_SIM_DRIVER = None
+_SIM_DRIVER_LOCK = threading.Lock()
+_SIM_LINK_LOCK = threading.Lock()
+_SIM_LINK_MAP = {}          # token -> original_url
+_SIM_LINK_REVERSE = {}      # original_url -> token
+_SIM_LINK_COUNTER = 0
+
+def _base36(n: int) -> str:
+    chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+    if n <= 0:
+        return "0"
+    out = []
+    while n:
+        n, r = divmod(n, 36)
+        out.append(chars[r])
+    return "".join(reversed(out))
+
+def _register_short_link(url: str) -> str:
+    """回傳短代碼 token；同一個 url 會重用相同 token。"""
+    global _SIM_LINK_COUNTER
+    if not url:
+        return ""
+    with _SIM_LINK_LOCK:
+        if url in _SIM_LINK_REVERSE:
+            return _SIM_LINK_REVERSE[url]
+        _SIM_LINK_COUNTER += 1
+        token = _base36(_SIM_LINK_COUNTER)
+        _SIM_LINK_MAP[token] = url
+        _SIM_LINK_REVERSE[url] = token
+        return token
+
+def _build_simulator_driver_options():
+    opts = Options()
+    opts.add_argument("--log-level=3")
+    opts.add_experimental_option("excludeSwitches", ["enable-logging"])
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--remote-debugging-pipe")
+    opts.add_argument("--disable-software-rasterizer")
+    if os.name == 'nt':
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-features=RendererCodeIntegrity")
+    apply_chrome_binary_option(opts)
+    return opts
+
+def _ensure_simulator_driver():
+    """確保可見的 Selenium 瀏覽器存在且已登入。"""
+    global _SIM_DRIVER
+    with _SIM_DRIVER_LOCK:
+        # 先檢查現有 session
+        if _SIM_DRIVER is not None:
+            try:
+                _ = _SIM_DRIVER.current_url
+            except Exception:
+                try:
+                    _SIM_DRIVER.quit()
+                except Exception:
+                    pass
+                _SIM_DRIVER = None
+
+        if _SIM_DRIVER is None:
+            _SIM_DRIVER = create_webdriver(_build_simulator_driver_options(), hide_windows_console=True)
+
+        # 確保已登入（若被導向登入頁會自動登入）
+        try:
+            ensure_logged_in(_SIM_DRIVER, USERNAME, PASSWORD, silent=True)
+        except Exception:
+            pass
+        return _SIM_DRIVER
+
+def _open_in_simulator(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        drv = _ensure_simulator_driver()
+        drv.get(url)
+        # 若被重導向登入頁：登入後再跳回原活動
+        try:
+            cur = (drv.current_url or "").lower()
+        except Exception:
+            cur = ""
+        if "login" in cur:
+            try:
+                ensure_logged_in(drv, USERNAME, PASSWORD, silent=True)
+                drv.get(url)
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+class _SimulatorRequestHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write("ok".encode("utf-8"))
+            return
+
+        # 短連結：/o/<token>
+        if parsed.path.startswith("/o/"):
+            token = parsed.path.split("/", 2)[2] if len(parsed.path.split("/", 2)) >= 3 else ""
+            url = ""
+            with _SIM_LINK_LOCK:
+                url = _SIM_LINK_MAP.get(token, "")
+            if not url:
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write("找不到短連結".encode("utf-8"))
+                return
+            ok = _open_in_simulator(url)
+            self.send_response(200 if ok else 500)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            msg = f"已在模擬器中開啟：{url}" if ok else f"開啟失敗：{url}"
+            self.wfile.write(msg.encode("utf-8"))
+            return
+
+        if parsed.path != "/open":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        qs = urllib.parse.parse_qs(parsed.query)
+        url = (qs.get("url") or [""])[0]
+        url = urllib.parse.unquote(url)
+        if not (url.startswith("http://") or url.startswith("https://")):
+            self.send_response(400)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write("無效的 URL".encode("utf-8"))
+            return
+
+        ok = _open_in_simulator(url)
+        self.send_response(200 if ok else 500)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        msg = f"已在模擬器中開啟：{url}" if ok else f"開啟失敗：{url}"
+        self.wfile.write(msg.encode("utf-8"))
+
+    def log_message(self, format, *args):
+        # 靜默，不污染終端輸出
+        return
+
+def start_simulator_server():
+    """啟動本機 HTTP 轉發器，回傳 base url（例如 http://127.0.0.1:12345）。"""
+    global _SIM_SERVER, _SIM_BASE_URL
+    if os.environ.get("DISABLE_SIM_SERVER", "0").strip() in {"1", "true", "yes", "on"}:
+        return None
+    if _SIM_BASE_URL:
+        return _SIM_BASE_URL
+    try:
+        class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+            daemon_threads = True
+
+        _SIM_SERVER = _ThreadingHTTPServer(("127.0.0.1", 0), _SimulatorRequestHandler)
+        port = _SIM_SERVER.server_address[1]
+        _SIM_BASE_URL = f"http://127.0.0.1:{port}"
+        threading.Thread(target=_SIM_SERVER.serve_forever, daemon=True).start()
+
+        def _shutdown():
+            try:
+                if _SIM_SERVER:
+                    _SIM_SERVER.shutdown()
+            except Exception:
+                pass
+            try:
+                if _SIM_SERVER:
+                    _SIM_SERVER.server_close()
+            except Exception:
+                pass
+            try:
+                if _SIM_DRIVER is not None:
+                    _SIM_DRIVER.quit()
+            except Exception:
+                pass
+
+        atexit.register(_shutdown)
+        return _SIM_BASE_URL
+    except Exception:
+        _SIM_SERVER = None
+        _SIM_BASE_URL = None
+        return None
+
+def make_simulator_open_link(original_url: str) -> str:
+    """把 Moodle/外部連結包成可點擊的本機短連結（若伺服器不可用則回傳原網址）。"""
+    if not original_url or not isinstance(original_url, str):
+        return original_url
+    base = _SIM_BASE_URL
+    if not base:
+        return original_url
+    try:
+        token = _register_short_link(original_url)
+        if token:
+            return f"{base}/o/{token}"
+        encoded = urllib.parse.quote(original_url, safe="")
+        return f"{base}/open?url={encoded}"
+    except Exception:
+        return original_url
+
 def _register_temp_dl_dir(path: str) -> None:
     try:
         if path:
@@ -449,11 +658,12 @@ def get_password_input(prompt):
 
 def test_login(username, password):
     """測試登入是否成功，使用現有的登入函數"""
+    test_driver = None
     try:
         # 創建臨時瀏覽器進行登入測試
         test_chrome_options = Options()
         if os.name == 'nt':
-            test_chrome_options.add_argument("--headless=new")
+            test_chrome_options.add_argument("--headless")
         else:
             test_chrome_options.add_argument("--headless")
         test_chrome_options.add_argument("--disable-gpu")
@@ -465,68 +675,16 @@ def test_login(username, password):
         apply_chrome_binary_option(test_chrome_options)
 
         test_driver = create_webdriver(test_chrome_options, hide_windows_console=True)
-        
-        # 使用現有的登入函數邏輯
-        test_driver.get("https://elearningv4.nuk.edu.tw/login/index.php?loginredirect=1")
-        WebDriverWait(test_driver, 10).until(
-            EC.visibility_of_element_located((By.ID, "username"))
-        ).send_keys(username)
-        
-        # 使用現有的 simulate_typing 函數邏輯
-        password_script = f"""
-        var element = document.getElementById('password');
-        element.focus();
-        element.value = '';
-        
-        // 模擬逐字輸入
-        var text = '{password}';
-        for (let i = 0; i < text.length; i++) {{
-            element.value += text[i];
-            element.dispatchEvent(new KeyboardEvent('keydown', {{
-                key: text[i],
-                char: text[i],
-                bubbles: true
-            }}));
-            element.dispatchEvent(new Event('input', {{ bubbles: true }}));
-            element.dispatchEvent(new KeyboardEvent('keyup', {{
-                key: text[i],
-                char: text[i],
-                bubbles: true
-            }}));
-        }}
-        
-        element.dispatchEvent(new Event('change', {{ bubbles: true }}));
-        element.blur();
-        """
-        test_driver.execute_script(password_script)
-        test_driver.execute_script("document.getElementById('loginbtn').click();")
-        time.sleep(2)  # 等待登入處理
-        
-        # 檢查是否有錯誤警告
-        try:
-            error_alert = test_driver.find_element(By.CSS_SELECTOR, "div.alert.alert-danger")
-            if "帳號不存在或密碼錯誤" in error_alert.text:
-                test_driver.quit()
-                return False
-        except:
-            pass
-        
-        # 檢查是否被重新導向到登入頁面（表示登入失敗）
-        current_url = test_driver.current_url
-        if "login" in current_url:
-            test_driver.quit()
-            return False
-        
-        # 登入成功
-        test_driver.quit()
-        return True
-        
-    except Exception as e:
-        try:
-            test_driver.quit()
-        except:
-            pass
+        ok = ensure_logged_in(test_driver, username, password, silent=True, max_retries=2)
+        return bool(ok)
+    except Exception:
         return False
+    finally:
+        try:
+            if test_driver:
+                test_driver.quit()
+        except Exception:
+            pass
 
 def setup_chrome():
     """在 macOS 上檢查並自動安裝 Chrome。"""
@@ -1195,19 +1353,8 @@ def check_assignments_background_early(course_hrefs_snapshot, username, password
         bg_driver = create_webdriver(bg_options, hide_windows_console=True)
 
         # 登入（避免依賴主流程的 driver）
-        bg_driver.get("https://elearningv4.nuk.edu.tw/login/index.php?loginredirect=1")
-        WebDriverWait(bg_driver, 10).until(
-            EC.visibility_of_element_located((By.ID, "username"))
-        ).send_keys(username)
-        try:
-            pw = bg_driver.find_element(By.ID, "password")
-            pw.clear()
-            pw.send_keys(password)
-        except Exception:
-            # 若被前端改版，退回用 JS
-            bg_driver.execute_script("document.getElementById('password').value = arguments[0];", password)
-        bg_driver.execute_script("document.getElementById('loginbtn').click();")
-        time.sleep(0.2)
+        if not ensure_logged_in(bg_driver, username, password, silent=True, max_retries=2):
+            raise RuntimeError("背景作業檢查登入失敗")
 
         # 開始檢查課程作業
         for course_href in list(course_hrefs_snapshot or []):
@@ -1443,21 +1590,92 @@ def simulate_typing(driver, element_id, text):
     """
     driver.execute_script(script)
 
+def ensure_logged_in(driver, username, password, *, silent=False, max_retries=2) -> bool:
+    """確保目前 driver 已登入 Moodle。
+
+    - 若已登入：直接回傳 True
+    - 若在登入頁/被重導：自動填入帳密並登入
+    """
+    login_url = "https://elearningv4.nuk.edu.tw/login/index.php?loginredirect=1"
+
+    def _is_logged_in() -> bool:
+        try:
+            cur = (driver.current_url or "").lower()
+            if "login" in cur:
+                return False
+        except Exception:
+            return False
+        try:
+            # 能看到「我的課程」通常代表已登入
+            driver.find_element(By.PARTIAL_LINK_TEXT, "我的課程")
+            return True
+        except Exception:
+            pass
+        # 保底：打 /my/ 看是否還會被導去 login
+        try:
+            driver.get("https://elearningv4.nuk.edu.tw/my/")
+            time.sleep(0.2)
+            cur2 = (driver.current_url or "").lower()
+            return "login" not in cur2
+        except Exception:
+            return False
+
+    if _is_logged_in():
+        return True
+
+    for attempt in range(max_retries):
+        try:
+            driver.get(login_url)
+            WebDriverWait(driver, 10).until(
+                EC.visibility_of_element_located((By.ID, "username"))
+            ).send_keys(username)
+
+            # 密碼欄位用 simulate_typing（更貼近人類輸入）
+            try:
+                simulate_typing(driver, 'password', password)
+            except Exception:
+                try:
+                    pw = driver.find_element(By.ID, "password")
+                    pw.clear()
+                    pw.send_keys(password)
+                except Exception:
+                    driver.execute_script("document.getElementById('password').value = arguments[0];", password)
+
+            driver.execute_script("document.getElementById('loginbtn').click();")
+            time.sleep(0.3)
+
+            # 等待不要再停留 login
+            try:
+                WebDriverWait(driver, 10).until(lambda d: "login" not in (d.current_url or "").lower())
+            except Exception:
+                pass
+
+            if _is_logged_in():
+                return True
+        except Exception as e:
+            if not silent:
+                try:
+                    print(f"{YELLOW}! 自動登入失敗，重試中... ({attempt+1}/{max_retries}){RESET}")
+                except Exception:
+                    pass
+            if attempt < max_retries - 1:
+                time.sleep(0.5)
+                continue
+            return False
+
+    return False
+
 def login_to_moodle(driver):
     """執行登入流程"""
-    driver.get("https://elearningv4.nuk.edu.tw/login/index.php?loginredirect=1")
-    WebDriverWait(driver, 5).until(  # 減少等待時間
-        EC.visibility_of_element_located((By.ID, "username"))
-    ).send_keys(USERNAME)
-    simulate_typing(driver, 'password', PASSWORD)
-    driver.execute_script("document.getElementById('loginbtn').click();")
-    time.sleep(0.2)  # 減少等待時間
+    # 舊函式保留相容性：統一走 ensure_logged_in
+    ensure_logged_in(driver, USERNAME, PASSWORD, silent=True, max_retries=2)
 
 def _relogin_best_effort(driver) -> bool:
     """主 driver 斷線重建後的輕量重新登入流程（不直接 sys.exit）。"""
     for _attempt in range(2):
         try:
-            login_to_moodle(driver)
+            if not ensure_logged_in(driver, USERNAME, PASSWORD, silent=True, max_retries=2):
+                continue
             wait_local = WebDriverWait(driver, 5)
             my_courses_link = wait_local.until(
                 EC.presence_of_element_located((By.PARTIAL_LINK_TEXT, "我的課程"))
@@ -1548,55 +1766,26 @@ def select_ongoing_courses_filter(driver, wait):
     except Exception:
         return False
 
-# 登入重試機制（最多2次）
+# 登入 + 進入「我的課程」
+if not ensure_logged_in(driver, USERNAME, PASSWORD, silent=False, max_retries=2):
+    print(f"\n{RED}{'='*60}{RESET}")
+    print(f"{RED}X 登入失敗：無法進入系統{RESET}")
+    print(f"\n按 Enter 鍵離開...")
+    input()
+    driver.quit()
+    sys.exit(1)
 
-login_success = False
-for attempt in range(2):
-    
-    login_to_moodle(driver)
-    
-    wait = WebDriverWait(driver, 5)  # 減少等待時間
-    
-    # 嘗試進入「我的課程」
-    try:
-        my_courses_link = wait.until(EC.presence_of_element_located((By.PARTIAL_LINK_TEXT, "我的課程")))
-        my_courses_link.click()
-        time.sleep(0.2)  # 減少等待時間
-        select_ongoing_courses_filter(driver, wait)
-        
-        # 檢查是否被重定向回登入頁面
-        current_url = driver.current_url
-        if "login" in current_url:
-            if attempt < 1:  # 還有重試機會
-                continue
-            else:  # 最後一次也失敗
-                print(f"\n{RED}{'='*60}{RESET}")
-                print(f"{RED}X 登入失敗：無法進入系統{RESET}")
-                print(f"\n按 Enter 鍵離開...")
-                input()
-                driver.quit()
-                sys.exit(1)
-        else:
-            # 登入成功
-            login_success = True
-            break
-            
-    except Exception as e:
-        if attempt < 1:  # 還有重試機會
-            continue
-        else:  # 最後一次也失敗
-            print(f"\n{RED}{'='*60}{RESET}")
-            print(f"{RED}X 登入失敗：無法連接到 Moodle {RESET}")
-            print(f"{RED}{'='*60}{RESET}")
-            print(f"\n錯誤訊息：{e}")
-            print(f"\n按 Enter 鍵離開...")
-            input()
-            driver.quit()
-            sys.exit(1)
-
-if not login_success:
-    print(f"\n{RED}X 登入失敗{RESET}")
-    print(f"按 Enter 鍵離開...")
+try:
+    wait = WebDriverWait(driver, 5)
+    my_courses_link = wait.until(EC.presence_of_element_located((By.PARTIAL_LINK_TEXT, "我的課程")))
+    my_courses_link.click()
+    time.sleep(0.2)
+    select_ongoing_courses_filter(driver, wait)
+except Exception as e:
+    print(f"\n{RED}{'='*60}{RESET}")
+    print(f"{RED}X 登入後無法進入『我的課程』{RESET}")
+    print(f"\n錯誤訊息：{e}")
+    print(f"\n按 Enter 鍵離開...")
     input()
     driver.quit()
     sys.exit(1)
@@ -1648,6 +1837,9 @@ if not course_hrefs:
     input()
     driver.quit()
     sys.exit(1)
+
+# 啟動「模擬瀏覽器」本機轉發器：讓終端輸出的連結可直接點開並自動登入
+start_simulator_server()
 
 # ====== 作業檢查：改為併入主流程（不再額外開新 driver / 新分頁） ======
 empty_assignments = []
@@ -2032,8 +2224,9 @@ with ThreadPoolExecutor(max_workers=len(all_tabs)) as executor:
                             for name, href_link in week_info[3]:
                                 # 再次確保活動名稱清理，移除換行字元和亂碼
                                 clean_name = clean_activity_name(name)
-                                # 活動名稱維持黃色，網址改為白色（預設）
-                                print(f"  {YELLOW}{clean_name}{RESET} - {href_link}")
+                                display_link = make_simulator_open_link(href_link) if href_link else href_link
+                                # 活動名稱維持黃色
+                                print(f"  {YELLOW}{clean_name}{RESET} - {display_link}")
                             print("")
                              
             
@@ -3494,7 +3687,7 @@ if empty_assignments:
         items_list.append({'type': 'assignment', 'data': item})
         spacing = "  " if current_idx <= 9 else " "
         color = MIKU if ibxx % 2 == 0 else BBLUE
-        due_str = f" (截止: {item['due_date_str']})" if item.get('due_date_str') else ""
+        due_str = f" {item['due_date_str']}" if item.get('due_date_str') else ""
         print(f"  {color}{current_idx}.{spacing}[{item.get('course','')}] {item['name']}{RED}{due_str}{RESET}")
         current_idx += 1
         ibxx += 1
@@ -3559,31 +3752,10 @@ if selected_assignments:
             raise
 
     # 重新登入
-    login_success = False
-    for login_attempt in range(2):
-        try:
-            driver.get("https://elearningv4.nuk.edu.tw/login/index.php?loginredirect=1")
-            WebDriverWait(driver, 10).until(
-                EC.visibility_of_element_located((By.ID, "username"))
-            ).send_keys(USERNAME)
-            simulate_typing(driver, 'password', PASSWORD)
-            driver.execute_script("document.getElementById('loginbtn').click();")
-            
-            time.sleep(0.2)
-            if "login" not in driver.current_url.lower():
-                login_success = True
-                break
-            else:
-                if login_attempt == 0:
-                    time.sleep(1)
-        except Exception:
-            if login_attempt == 0:
-                time.sleep(1)
-
-    if not login_success:
+    if not ensure_logged_in(driver, USERNAME, PASSWORD, silent=False, max_retries=2):
         try:
             driver.quit()
-        except:
+        except Exception:
             pass
         sys.exit()
 
