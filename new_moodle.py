@@ -3495,7 +3495,7 @@ if empty_assignments:
         spacing = "  " if current_idx <= 9 else " "
         color = MIKU if ibxx % 2 == 0 else BBLUE
         due_str = f" (截止: {item['due_date_str']})" if item.get('due_date_str') else ""
-        print(f"  {color}{current_idx}.{spacing}{item['name']}{RED}{due_str}{RESET}")
+        print(f"  {color}{current_idx}.{spacing}[{item.get('course','')}] {item['name']}{RED}{due_str}{RESET}")
         current_idx += 1
         ibxx += 1
 
