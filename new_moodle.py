@@ -2457,30 +2457,61 @@ def should_skip_download_filename(filename):
 
 
 def extract_file(file_path, dest_dir):
+    temp_extract_dir = None
+
+    def _move_extracted_files_no_overwrite(src_root: str, dst_root: str) -> int:
+        moved = 0
+        for cur_root, _, files in os.walk(src_root):
+            for filename in files:
+                src_path = os.path.join(cur_root, filename)
+                try:
+                    rel_path = os.path.relpath(src_path, src_root)
+                except Exception:
+                    rel_path = filename
+                target_path = os.path.join(dst_root, rel_path)
+                target_dir = os.path.dirname(target_path)
+                try:
+                    os.makedirs(target_dir, exist_ok=True)
+                except Exception:
+                    # 目的地路徑若遇到「檔案擋住資料夾」等情況，退回直接丟到根目錄
+                    target_path = os.path.join(dst_root, os.path.basename(target_path))
+                    target_dir = os.path.dirname(target_path)
+                    os.makedirs(target_dir, exist_ok=True)
+
+                target_path = ensure_unique_filename(target_path)
+                shutil.move(src_path, target_path)
+                moved += 1
+        return moved
+
     try:
+        os.makedirs(dest_dir, exist_ok=True)
+        temp_extract_dir = tempfile.mkdtemp(prefix="_temp_extract_", dir=dest_dir)
+
         # 驗證檔案格式（檢查 magic bytes）
         with open(file_path, 'rb') as f:
             header = f.read(16)
-        
+
         # ZIP 檔案的 magic bytes: 50 4B (PK)
         # RAR 檔案的 magic bytes: 52 61 72 21 (Rar!)
         # 7Z 檔案的 magic bytes: 37 7A BC AF 27 1C
         is_zip = header[:2] == b'PK'
         is_rar = header[:4] == b'Rar!' or header[:7] == b'\x52\x61\x72\x21\x1A\x07\x01'  # RAR 5.0
         is_7z = header[:6] == b'7z\xbc\xaf\x27\x1c'
-        
+
         # 檢查檔案是否為 HTML（可能是下載錯誤頁面）
         is_html = header[:15].lower().startswith(b'<!doctype html') or header[:6].lower().startswith(b'<html')
-        
+
         if is_html:
             print(f"   {YELLOW}! 檔案不是壓縮檔，而是 HTML 頁面，跳過解壓{RESET}")
             return False
-        
+
+        extracted_ok = False
+
         if file_path.endswith(".zip"):
             if not is_zip:
                 print(f"   {YELLOW}! 檔案副檔名為 .zip 但不是有效的 ZIP 格式，跳過解壓{RESET}")
                 return False
-            
+
             # 處理 ZIP 檔案的中文檔名亂碼問題
             with zipfile.ZipFile(file_path, 'r') as zf:
                 for info in zf.infolist():
@@ -2490,21 +2521,18 @@ def extract_file(file_path, dest_dir):
                         info.filename = fixed_filename
                     except (UnicodeDecodeError, UnicodeEncodeError):
                         try:
-                            # 嘗試 GBK 編碼
                             fixed_filename = info.filename.encode('cp437').decode('gbk')
                             info.filename = fixed_filename
-                        except:
-                            # 如果都失敗，保持原檔名
+                        except Exception:
                             pass
-                    
-                    # 解壓縮單個檔案
-                    zf.extract(info, dest_dir)
-                    
+                    zf.extract(info, temp_extract_dir)
+            extracted_ok = True
+
         elif file_path.endswith(".rar"):
             if not is_rar:
                 print(f"   {YELLOW}! 檔案副檔名為 .rar 但不是有效的 RAR 格式，跳過解壓{RESET}")
                 return False
-            
+
             # 方法1: 使用 7-Zip（最穩定，Windows 常見）
             seven_zip_paths = [
                 r"C:\Program Files\7-Zip\7z.exe",
@@ -2514,49 +2542,56 @@ def extract_file(file_path, dest_dir):
                 if os.path.exists(seven_zip):
                     try:
                         result = subprocess.run(
-                            [seven_zip, "x", file_path, f"-o{dest_dir}", "-y"],
+                            [seven_zip, "x", file_path, f"-o{temp_extract_dir}", "-y"],
                             capture_output=True,
                             text=True,
                             timeout=60
                         )
                         if result.returncode == 0:
-                            return True
+                            extracted_ok = True
+                            break
                     except Exception as e:
                         print(f"{YELLOW}!  7-Zip 解壓失敗: {e}{RESET}")
-            
+
             # 方法2: 優先使用 patool（更穩定，支持多種後端）
-            if HAS_PATOOL:
+            if not extracted_ok and HAS_PATOOL:
                 try:
-                    patool.extract_archive(file_path, outdir=dest_dir, verbosity=-1)
-                    return True
+                    patool.extract_archive(file_path, outdir=temp_extract_dir, verbosity=-1)
+                    extracted_ok = True
                 except Exception as e:
                     print(f"{YELLOW}!  patool 解壓失敗: {e}{RESET}")
-            
+
             # 方法3: 使用 rarfile
-            if HAS_RARFILE:
+            if not extracted_ok and HAS_RARFILE:
                 try:
                     with rarfile.RarFile(file_path, 'r') as rf:
-                        rf.extractall(dest_dir)
-                    return True
+                        rf.extractall(temp_extract_dir)
+                    extracted_ok = True
                 except Exception as e:
                     print(f"{YELLOW}!  rarfile 解壓失敗: {e}{RESET}")
-            
-            # 都失敗，顯示安裝提示
-            print(f"{YELLOW}!  無法解壓 RAR 檔案，已跳過: {os.path.basename(file_path)}{RESET}")
-            print(f"   💡 7-Zip 已安裝但無法使用，請嘗試：")
-            print(f"   1. 重新啟動終端或電腦")
-            print(f"   2. 或手動安裝: winget install 7zip.7zip")
-            return False
-            
+
+            if not extracted_ok:
+                print(f"{YELLOW}!  無法解壓 RAR 檔案，已跳過: {os.path.basename(file_path)}{RESET}")
+                print(f"   💡 7-Zip 已安裝但無法使用，請嘗試：")
+                print(f"   1. 重新啟動終端或電腦")
+                print(f"   2. 或手動安裝: winget install 7zip.7zip")
+                return False
+
         elif file_path.endswith(".7z"):
             if not is_7z:
                 print(f"   {YELLOW}! 檔案副檔名為 .7z 但不是有效的 7Z 格式，跳過解壓{RESET}")
                 return False
-            
+
             with py7zr.SevenZipFile(file_path, 'r') as sz:
-                sz.extractall(dest_dir)
+                sz.extractall(temp_extract_dir)
+            extracted_ok = True
         else:
             return False
+
+        if not extracted_ok:
+            return False
+
+        _move_extracted_files_no_overwrite(temp_extract_dir, dest_dir)
         return True
     except zipfile.BadZipFile:
         print(f"   {YELLOW}! 無效的 ZIP 檔案格式，跳過解壓{RESET}")
@@ -2564,6 +2599,12 @@ def extract_file(file_path, dest_dir):
     except Exception as e:
         print(f"X 解壓失敗: {os.path.basename(file_path)}, 原因: {e}")
         return False
+    finally:
+        try:
+            if temp_extract_dir and os.path.exists(temp_extract_dir):
+                shutil.rmtree(temp_extract_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 def create_session_with_cookies():
     """
