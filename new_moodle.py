@@ -2263,10 +2263,11 @@ def goto_my_courses_page(driver_obj, *, wait_seconds: int = 10) -> bool:
     for url in targets:
         try:
             driver_obj.get(url)
-            try:
-                WebDriverWait(driver_obj, wait_seconds).until(lambda d: not _looks_like_login_page(d))
-            except Exception:
-                pass
+            if wait_seconds and wait_seconds > 0:
+                try:
+                    WebDriverWait(driver_obj, wait_seconds).until(lambda d: not _looks_like_login_page(d))
+                except Exception:
+                    pass
             if not _looks_like_login_page(driver_obj):
                 return True
         except Exception:
@@ -2290,7 +2291,8 @@ def ensure_logged_in(driver, username, password, *, silent=False, max_retries=2)
     def _is_logged_in() -> bool:
         # 以直達 /my/ 為準：若仍被導向 login 則視為未登入
         try:
-            return goto_my_courses_page(driver, wait_seconds=5)
+            # 不要在「登入前檢查」階段額外等待，避免拖慢每次啟動。
+            return goto_my_courses_page(driver, wait_seconds=0)
         except Exception:
             return False
 
