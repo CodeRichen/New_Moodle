@@ -2461,15 +2461,43 @@ def _open_course_tabs_with_retry(course_hrefs_list):
 
 def select_ongoing_courses_filter(driver, wait):
     """進入我的課程後，切換分組到「進行中」（TODO:若要下載全部則 Ctrl+h 將"進行中"取代為"過去"）"""
+    debug = os.environ.get("DEBUG_COURSE_FILTER", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _get_active_grouping_text() -> str:
+        try:
+            txt = driver.execute_script("""
+                const btn = document.getElementById('groupingdropdown');
+                if (!btn) return '';
+                const span = btn.querySelector('[data-active-item-text]');
+                if (span && span.textContent) return span.textContent.trim();
+                const aria = btn.getAttribute('aria-label') || '';
+                if (aria) return aria.trim();
+                // 注意：btn.innerText 可能包含下拉選單文字，不可靠
+                return (btn.textContent || '').trim();
+            """)
+            return (txt or "").strip()
+        except Exception:
+            return ""
+
+    def _looks_like_ongoing(active_text: str) -> bool:
+        t = (active_text or "").strip()
+        if not t:
+            return False
+        # 避免把「過去」也包含在內的文字誤判
+        return ("進行中" in t) and ("過去" not in t)
+
     try:
-        # 先判斷當前是否已是「進行中」
-        current_text = driver.execute_script("""
-            const btn = document.getElementById('groupingdropdown');
-            if (!btn) return '';
-            const span = btn.querySelector('span[data-active-item-text]');
-            return (span ? span.innerText : btn.innerText) || '';
-        """)
-        if "進行中" in (current_text or ""):
+        # 先等 dropdown 出現（第一次執行/網路慢時很常還沒出現）
+        try:
+            wait.until(EC.presence_of_element_located((By.ID, "groupingdropdown")))
+        except Exception:
+            return False
+
+        current_text = _get_active_grouping_text()
+        if debug:
+            print(f"{YELLOW}[DEBUG] groupingdropdown active: {current_text}{RESET}")
+
+        if _looks_like_ongoing(current_text):
             return True
 
         dropdown_btn = wait.until(EC.element_to_be_clickable((By.ID, "groupingdropdown")))
@@ -2477,15 +2505,39 @@ def select_ongoing_courses_filter(driver, wait):
         time.sleep(0.2)
 
         option_clicked = driver.execute_script("""
-            const candidates = Array.from(document.querySelectorAll('.dropdown-menu a, .dropdown-menu button, .dropdown-item'));
-            const target = candidates.find(el => ((el.innerText || '').trim() === '進行中') || (el.innerText || '').includes('進行中'));
+            const btn = document.getElementById('groupingdropdown');
+            if (!btn) return false;
+            // 盡量只在這個 dropdown 的 menu 內找，避免誤點其他選單
+            const root = btn.closest('.dropdown') || btn.parentElement;
+            let menu = root ? root.querySelector('.dropdown-menu') : null;
+            if (!menu) menu = document.querySelector('.dropdown-menu.show');
+            if (!menu) return false;
+            const items = Array.from(menu.querySelectorAll('a, button, .dropdown-item'));
+            const norm = s => (s || '').replace(/\s+/g,' ').trim();
+            const target = items.find(el => {
+                const t = norm(el.innerText || el.textContent || '');
+                return t === '進行中' || t.includes('進行中');
+            });
             if (!target) return false;
             target.click();
             return true;
         """)
-        if option_clicked:
-            time.sleep(0.2)
-        return bool(option_clicked)
+
+        if not option_clicked:
+            if debug:
+                print(f"{YELLOW}[DEBUG] cannot find/click '進行中' option{RESET}")
+            return False
+
+        # 等到 active text 真的變成「進行中」才算成功
+        try:
+            WebDriverWait(driver, 8).until(lambda d: _looks_like_ongoing(_get_active_grouping_text()))
+        except Exception:
+            pass
+
+        after_text = _get_active_grouping_text()
+        if debug:
+            print(f"{YELLOW}[DEBUG] groupingdropdown after: {after_text}{RESET}")
+        return _looks_like_ongoing(after_text)
     except Exception:
         return False
 
@@ -2510,7 +2562,13 @@ try:
         ensure_logged_in(driver, USERNAME, PASSWORD, silent=True, max_retries=2)
     if not ok_my:
         raise RuntimeError("登入後仍無法進入 /my/ 或 /my/courses.php")
-    select_ongoing_courses_filter(driver, wait)
+    # 第一次載入可能較慢：若切換失敗就再重試一次
+    if not select_ongoing_courses_filter(driver, WebDriverWait(driver, 12)):
+        try:
+            driver.get(f"{MOODLE_BASE_URL}/my/courses.php")
+        except Exception:
+            pass
+        select_ongoing_courses_filter(driver, WebDriverWait(driver, 12))
 except Exception as e:
     print(f"\n{RED}{'='*60}{RESET}")
     print(f"{RED}X 登入後無法進入『我的課程』（已重試）{RESET}")
@@ -2526,8 +2584,15 @@ except Exception as e:
 def snapshot_course_hrefs(driver):
     """用 JS 快照課程連結，降低前端版型變更造成的定位失敗。"""
     script = """
-    const nodes = Array.from(document.querySelectorAll("a[href*='/course/view.php?id=']"));
-    const hrefs = nodes
+        const nodes = Array.from(document.querySelectorAll("a[href*='/course/view.php?id=']"));
+        // 優先取「可見」的連結，避免抓到被隱藏/折疊的過去課程區塊
+        const visible = nodes.filter(a => {
+            try {
+                return a && a.offsetParent !== null;
+            } catch(e) { return false; }
+        });
+        const src = (visible.length ? visible : nodes);
+        const hrefs = src
       .map(a => a.getAttribute('href') || a.href || '')
       .filter(Boolean)
       .map(h => h.split('#')[0]);
@@ -2549,7 +2614,16 @@ for attempt in range(3):
             driver.get("https://elearningv4.nuk.edu.tw/my/courses.php")
 
         wait = WebDriverWait(driver, 12)
-        select_ongoing_courses_filter(driver, wait)
+        ok_filter = select_ongoing_courses_filter(driver, wait)
+        if not ok_filter:
+            # 若切換失敗，先刷新一次再試（避免抓到過去全部）
+            try:
+                driver.refresh()
+            except Exception:
+                pass
+            ok_filter = select_ongoing_courses_filter(driver, WebDriverWait(driver, 12))
+        if not ok_filter and os.environ.get("DEBUG_COURSE_FILTER", "0") not in {"1", "true", "yes", "on"}:
+            print(f"{YELLOW}! 提醒：無法確認已切換到『進行中』，可能會抓到過去課程；可設 DEBUG_COURSE_FILTER=1 觀察{RESET}")
         course_hrefs = wait.until(lambda d: snapshot_course_hrefs(d))
         if course_hrefs:
             break
