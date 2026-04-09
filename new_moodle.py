@@ -760,6 +760,7 @@ ASSIGNMENT_CHECK_LIMIT = 12
 PASSWORD_FILE = os.path.join(BASE_DOWNLOAD_DIR, "password.txt")
 BUILDERROR_MARKER = "builderror"
 NONPOP_MARKER = "nonpop"
+POPUP_DISABLE_MARKERS = {"nonpop", "nopop"}
 
 # 確保主目錄存在
 os.makedirs(BASE_DOWNLOAD_DIR, exist_ok=True)
@@ -799,6 +800,7 @@ _threading_err.excepthook = _thread_excepthook
 # 初始化第一次使用標記
 IS_FIRST_TIME = False
 AUTO_OPEN_NEW_ACTIVITY_FOLDERS = True
+IS_BUILD_ENV = False
 
 def get_password_input(prompt):
     """自定義密碼輸入函數，顯示星號（Windows）或隱藏輸入（macOS/Linux）"""
@@ -1454,7 +1456,7 @@ def append_marker_to_password_file(marker):
 # 讀取帳號密碼
 def load_credentials():
     """從 password.txt 讀取帳號密碼，如果不存在則讓使用者輸入並創建"""
-    global IS_FIRST_TIME, AUTO_OPEN_NEW_ACTIVITY_FOLDERS  # 使用全域變數來追蹤狀態
+    global IS_FIRST_TIME, AUTO_OPEN_NEW_ACTIVITY_FOLDERS, IS_BUILD_ENV  # 使用全域變數來追蹤狀態
     
     try:
         if os.path.exists(PASSWORD_FILE):
@@ -1470,11 +1472,13 @@ def load_credentials():
                         sys.exit(1)
                     markers = {line.strip().lower() for line in lines[2:] if line.strip()}
                     has_builderror = any(line.strip().lower() == BUILDERROR_MARKER for line in lines)
-                    has_nonpop = NONPOP_MARKER in markers
+                    has_nonpop = any(m in markers for m in POPUP_DISABLE_MARKERS)
                     if has_builderror:
                         IS_FIRST_TIME = True
+                        IS_BUILD_ENV = True
                     else:
                         IS_FIRST_TIME = False
+                        IS_BUILD_ENV = False
                     AUTO_OPEN_NEW_ACTIVITY_FOLDERS = not has_nonpop
                     return username, password
                 else:
@@ -1493,6 +1497,7 @@ def load_credentials():
             # 第一次使用，讓使用者輸入帳號密碼
             IS_FIRST_TIME = True
             AUTO_OPEN_NEW_ACTIVITY_FOLDERS = True
+            IS_BUILD_ENV = True
             print(f"{YELLOW}請輸入你的 Moodle 帳號密碼：{RESET}")
             
             while True:  # 持續輸入直到登入成功
@@ -2645,6 +2650,13 @@ if not course_hrefs:
     driver.quit()
     sys.exit(1)
 
+# 建置環境中：輸出課程數量（用於確認是否成功抓到課程清單）
+try:
+    if IS_BUILD_ENV:
+        print(f"{BLUE}課程數量：{len(course_hrefs)}{RESET}")
+except Exception:
+    pass
+
 # 啟動「模擬瀏覽器」本機轉發器：讓終端輸出的連結可直接點開並自動登入
 start_simulator_server()
 
@@ -3528,14 +3540,36 @@ def try_download_google_drive(gdrive_url, dest_dir, base_name, session):
 
     # 🔴 先自動開啟所有紅色課程的資料夾
     # - 預設會開
-    # - 若在 password.txt 第三行之後任一行加入「nonpop」，則不會自動開啟
-if red_activities_to_print and not IS_FIRST_TIME and AUTO_OPEN_NEW_ACTIVITY_FOLDERS:
-    opened_folders = set()
-    for name, link, course_name, week_header, course_path, course_url, description in red_activities_to_print:
-        if course_path not in opened_folders:
-            open_folder(course_path)
-            opened_folders.add(course_path)
-            time.sleep(0.2)  # 避免同時開啟太多視窗
+    # - 若在 password.txt 第三行之後任一行加入「nonpop」（或常見誤植 nopop），則不會自動開啟
+if red_activities_to_print and not IS_FIRST_TIME:
+    try:
+        distinct_courses = len({course_path for _name, _link, _course_name, _week_header, course_path, _course_url, _desc in red_activities_to_print})
+    except Exception:
+        distinct_courses = 0
+
+    # 若 password.txt 沒寫 nonpop/nopop 且本次新資訊課程太多，詢問並可寫入 nonpop
+    if distinct_courses >= 4 and AUTO_OPEN_NEW_ACTIVITY_FOLDERS:
+        try:
+            ans = input(
+                f"{YELLOW}! 本次共有 {distinct_courses} 門課有最新資料。\n"
+                f"是否關閉自動開啟資料夾（popup），並寫入 password.txt（nonpop）？ (y/N){RESET} "
+            ).strip().lower()
+            if ans in {"y", "yes"}:
+                AUTO_OPEN_NEW_ACTIVITY_FOLDERS = False
+                try:
+                    append_marker_to_password_file(NONPOP_MARKER)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    if AUTO_OPEN_NEW_ACTIVITY_FOLDERS:
+        opened_folders = set()
+        for name, link, course_name, week_header, course_path, course_url, description in red_activities_to_print:
+            if course_path not in opened_folders:
+                open_folder(course_path)
+                opened_folders.add(course_path)
+                time.sleep(0.2)  # 避免同時開啟太多視窗
 
     time.sleep(0.2)
 
