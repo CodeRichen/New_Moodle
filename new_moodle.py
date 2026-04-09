@@ -864,6 +864,100 @@ def setup_chrome():
         except Exception:
             return None
 
+    def _url_exists(url: str, *, timeout_sec: int = 20) -> bool:
+        """用 curl HEAD 檢查 URL 是否存在（避免下載大檔前就失敗）。"""
+        if not url:
+            return False
+        try:
+            subprocess.run(
+                [
+                    "curl", "--fail", "--location", "--head",
+                    "--connect-timeout", "10",
+                    "--max-time", str(timeout_sec),
+                    url,
+                ],
+                check=True,
+                capture_output=True,
+                timeout=timeout_sec + 5,
+            )
+            return True
+        except Exception:
+            return False
+
+    def _install_cft_by_static_versions(versions_to_try, plat: str) -> bool:
+        """不依賴 JSON：用固定版本清單逐一探測並安裝 Chrome for Testing。"""
+        home_dir = os.path.expanduser("~")
+        root_dir = os.path.join(home_dir, "chrome-for-testing")
+        os.makedirs(root_dir, exist_ok=True)
+        dl_dir = os.path.join(root_dir, "_downloads")
+        os.makedirs(dl_dir, exist_ok=True)
+
+        for version_str in versions_to_try:
+            version_str = (version_str or "").strip()
+            if not version_str:
+                continue
+
+            chrome_url = f"https://storage.googleapis.com/chrome-for-testing-public/{version_str}/{plat}/chrome-{plat}.zip"
+            driver_url = f"https://storage.googleapis.com/chrome-for-testing-public/{version_str}/{plat}/chromedriver-{plat}.zip"
+
+            # 先 HEAD 探測，避免浪費時間
+            if not (_url_exists(chrome_url) and _url_exists(driver_url)):
+                continue
+
+            print(f"{BLUE}安裝 Chrome for Testing {version_str}（{plat}，static）{RESET}")
+            chrome_zip = os.path.join(dl_dir, f"chrome-{plat}-{version_str}.zip")
+            driver_zip = os.path.join(dl_dir, f"chromedriver-{plat}-{version_str}.zip")
+
+            if not os.path.exists(chrome_zip):
+                if not _curl_download(chrome_url, chrome_zip, timeout_sec=900):
+                    continue
+            if not os.path.exists(driver_zip):
+                if not _curl_download(driver_url, driver_zip, timeout_sec=300):
+                    continue
+
+            # 清掉舊資料夾（避免混到舊版本）
+            try:
+                import shutil
+                shutil.rmtree(os.path.join(root_dir, f"chrome-{plat}"), ignore_errors=True)
+                shutil.rmtree(os.path.join(root_dir, f"chromedriver-{plat}"), ignore_errors=True)
+            except Exception:
+                pass
+
+            try:
+                with zipfile.ZipFile(chrome_zip, 'r') as zf:
+                    zf.extractall(root_dir)
+                with zipfile.ZipFile(driver_zip, 'r') as zf:
+                    zf.extractall(root_dir)
+            except Exception:
+                continue
+
+            chrome_bin = os.path.join(root_dir, f"chrome-{plat}", "Google Chrome for Testing.app", "Contents", "MacOS", "Google Chrome for Testing")
+            driver_bin = os.path.join(root_dir, f"chromedriver-{plat}", "chromedriver")
+            if not os.path.exists(chrome_bin) or not os.path.exists(driver_bin):
+                continue
+
+            try:
+                subprocess.run(["chmod", "+x", driver_bin], check=False, timeout=5)
+            except Exception:
+                pass
+
+            os.environ["CHROME_BINARY"] = chrome_bin
+            os.environ["CHROMEDRIVER_PATH"] = driver_bin
+            try:
+                global _cached_driver_path
+                _cached_driver_path = driver_bin
+            except Exception:
+                pass
+
+            if not is_chrome_usable(chrome_bin):
+                continue
+            reset_chromedriver_cache()
+            if can_start_chrome_webdriver(chrome_bin):
+                print(f"{GREEN}✓ Chrome for Testing 安裝完成：{version_str}{RESET}")
+                return True
+
+        return False
+
     def _install_chrome_for_testing_major_cap(max_major: int) -> bool:
         """安裝 Chrome for Testing + chromedriver 到 ~/chrome-for-testing（不需 sudo）。
 
@@ -875,8 +969,46 @@ def setup_chrome():
         kjson_url = "https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json"
         payload = _fetch_json(kjson_url, timeout_sec=25)
         if not payload or not isinstance(payload, dict):
-            print(f"{YELLOW}! 無法取得 Chrome for Testing 版本清單，請確認網路可連線：{kjson_url}{RESET}")
-            return False
+            # 有些網路環境會擋 googlechromelabs.github.io；改用 static 版本清單直接探測 storage
+            try:
+                print(f"{YELLOW}! 無法取得 Chrome for Testing 版本清單，改用備援版本探測下載（不依賴 {kjson_url}）{RESET}")
+            except Exception:
+                pass
+
+            env_list = os.environ.get("MACOS11_CHROME_VERSIONS", "").strip()
+            if env_list:
+                versions_to_try = [v.strip() for v in env_list.split(',') if v.strip()]
+            else:
+                # 由新到舊嘗試（不保證全部存在；會先 HEAD 探測）
+                versions_to_try = [
+                    "128.0.6613.137",
+                    "127.0.6533.120",
+                    "126.0.6478.127",
+                    "125.0.6422.142",
+                    "124.0.6367.208",
+                    "123.0.6312.123",
+                    "122.0.6261.130",
+                    "121.0.6167.185",
+                    "120.0.6099.225",
+                    "119.0.6045.200",
+                    "118.0.5993.71",
+                    "117.0.5938.150",
+                    "116.0.5845.188",
+                    "115.0.5790.171",
+                    "114.0.5735.199",
+                    "113.0.5672.93",
+                ]
+
+            # 套用 cap
+            filtered = []
+            for v in versions_to_try:
+                vt = _parse_ver_tuple(v)
+                if vt and vt[0] <= int(max_major):
+                    filtered.append(v)
+            if not filtered:
+                filtered = versions_to_try
+
+            return _install_cft_by_static_versions(filtered[:8], plat)
 
         versions = payload.get("versions") or []
         candidates = []
