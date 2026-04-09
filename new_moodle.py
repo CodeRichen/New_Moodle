@@ -190,13 +190,34 @@ def get_chrome_binary_path():
 
     if system_name == "Darwin":
         home_dir = os.path.expanduser("~")
-        candidates = [
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        # Big Sur (macOS 11.x) 上，使用者可能已安裝「太新」的系統 Chrome，啟動會直接 crash。
+        # 因此預設優先找 Chrome for Testing（若存在），最後才用 /Applications 的 system Chrome。
+        try:
+            ver = platform.mac_ver()[0] or ""
+            parts = [int(p) for p in ver.split('.') if p.isdigit()]
+            mac_major = parts[0] if parts else 0
+        except Exception:
+            mac_major = 0
+
+        cft_candidates = [
             os.path.join(home_dir, "chrome-for-testing", "chrome-mac-x64", "Google Chrome for Testing.app", "Contents", "MacOS", "Google Chrome for Testing"),
             os.path.join(home_dir, "chrome-for-testing", "chrome-mac-arm64", "Google Chrome for Testing.app", "Contents", "MacOS", "Google Chrome for Testing"),
+            "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
         ]
+        system_candidates = [
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ]
+        if mac_major and mac_major <= 11 and os.environ.get("PREFER_SYSTEM_CHROME", "0") != "1":
+            candidates = cft_candidates + system_candidates
+        else:
+            candidates = [
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+                os.path.join(home_dir, "chrome-for-testing", "chrome-mac-x64", "Google Chrome for Testing.app", "Contents", "MacOS", "Google Chrome for Testing"),
+                os.path.join(home_dir, "chrome-for-testing", "chrome-mac-arm64", "Google Chrome for Testing.app", "Contents", "MacOS", "Google Chrome for Testing"),
+            ]
     elif system_name == "Windows":
         local_appdata = os.environ.get("LOCALAPPDATA", "")
         program_files = os.environ.get("PROGRAMFILES", "")
@@ -832,6 +853,16 @@ def setup_chrome():
         except Exception:
             return 0
 
+    def _macos_version_tuple():
+        try:
+            ver = platform.mac_ver()[0] or ""
+            parts = [int(p) for p in ver.split('.') if p.isdigit()]
+            while len(parts) < 3:
+                parts.append(0)
+            return parts[0], parts[1], parts[2]
+        except Exception:
+            return 0, 0, 0
+
     def _parse_ver_tuple(v: str):
         try:
             return tuple(int(x) for x in (v or "").split('.') if x.isdigit())
@@ -1199,20 +1230,41 @@ def setup_chrome():
         return False
     
     # 先檢查 Chrome 是否存在且可用；若存在但損壞，仍需重裝。
+    # 注意：在 macOS 11.x 上，/Applications 的 system Chrome 可能太新，呼叫一次就 crash 跳視窗。
+    # 因此預設不主動 probe system Chrome，改優先走 Chrome for Testing（除非 PREFER_SYSTEM_CHROME=1）。
+    mac_major = _macos_major_version()
     existing_binary = get_chrome_binary_path()
-    if existing_binary and is_chrome_usable(existing_binary):
-        if can_start_chrome_webdriver(existing_binary):
-            return True
-        print(f"{YELLOW}! Chrome 可啟動，但 WebDriver 建立失敗，將自動修復{RESET}")
-        reset_chromedriver_cache()
-    if existing_binary and not is_chrome_usable(existing_binary):
-        print(f"{YELLOW}! 偵測到 Chrome 但無法啟動，將自動重新下載與修復{RESET}")
+    system_chrome_bin = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    skip_probe_system_chrome = (
+        mac_major and mac_major <= 11
+        and existing_binary == system_chrome_bin
+        and os.environ.get("PREFER_SYSTEM_CHROME", "0") != "1"
+    )
+    if not skip_probe_system_chrome:
+        if existing_binary and is_chrome_usable(existing_binary):
+            if can_start_chrome_webdriver(existing_binary):
+                return True
+            print(f"{YELLOW}! Chrome 可啟動，但 WebDriver 建立失敗，將自動修復{RESET}")
+            reset_chromedriver_cache()
+        if existing_binary and not is_chrome_usable(existing_binary):
+            print(f"{YELLOW}! 偵測到 Chrome 但無法啟動，將自動重新下載與修復{RESET}")
+    else:
+        print(f"{YELLOW}! macOS 11.x 預設略過 system Chrome 探測（避免因版本過新而 crash），改用 Chrome for Testing{RESET}")
 
     # macOS 11.x（Big Sur）：不要裝最新 stable（可能不相容），改裝 Chrome for Testing（cap 主版號）。
-    mac_major = _macos_major_version()
     if mac_major and mac_major <= 11:
-        cap = int(os.environ.get("MACOS11_CHROME_MAJOR_CAP", "128") or "128")
+        cap_env = (os.environ.get("MACOS11_CHROME_MAJOR_CAP", "") or "").strip()
+        if cap_env:
+            cap = int(cap_env)
+        else:
+            # Big Sur 11.x（尤其 11.5.x）對新版本 Chrome 需求的系統 framework 可能不足，
+            # 預設把 cap 壓低到較舊版本避免下載後必 crash。
+            cap = 114
+
+        mac_tuple = _macos_version_tuple()
         print(f"{YELLOW}! 偵測到 macOS {platform.mac_ver()[0]}，將下載相容的 Chrome for Testing（主版號 <= {cap}）{RESET}")
+        if mac_tuple[0] == 11 and mac_tuple[1] <= 5 and not cap_env:
+            print(f"{YELLOW}! 你的 macOS 版本偏舊（11.{mac_tuple[1]}），若仍遇到 Chrome crash，建議先更新到 11.7.x（或設定 MACOS11_CHROME_MAJOR_CAP 更低）{RESET}")
         ok = _install_chrome_for_testing_major_cap(cap)
         if ok:
             return True
