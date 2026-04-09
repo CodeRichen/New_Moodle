@@ -8,6 +8,26 @@ import contextlib
 import io
 import re
 
+# Moodle 主站（需要在第一次輸入帳密前就可用）
+MOODLE_BASE_URL = "https://elearningv4.nuk.edu.tw"
+
+# --- 登入錯誤快取（讓 test_login / load_credentials / ensure_logged_in 能顯示明確原因） ---
+_LAST_LOGIN_ERROR_KIND = None
+_LAST_LOGIN_ERROR_TEXT = None
+
+def clear_last_login_error():
+    global _LAST_LOGIN_ERROR_KIND, _LAST_LOGIN_ERROR_TEXT
+    _LAST_LOGIN_ERROR_KIND = None
+    _LAST_LOGIN_ERROR_TEXT = None
+
+def set_last_login_error(kind, text):
+    global _LAST_LOGIN_ERROR_KIND, _LAST_LOGIN_ERROR_TEXT
+    _LAST_LOGIN_ERROR_KIND = kind
+    _LAST_LOGIN_ERROR_TEXT = text
+
+def get_last_login_error():
+    return _LAST_LOGIN_ERROR_KIND, _LAST_LOGIN_ERROR_TEXT
+
 # ========== 使用 Windows API 設定終端機視窗為全螢幕 ==========
 def maximize_console_window():
     """將終端機視窗最大化（僅在非 exe 環境下執行）"""
@@ -829,10 +849,83 @@ def test_login(username, password):
         apply_chrome_binary_option(test_chrome_options)
 
         test_driver = create_webdriver(test_chrome_options, hide_windows_console=True)
-        ok = ensure_logged_in(test_driver, username, password, silent=True, max_retries=2)
-        return bool(ok)
+        clear_last_login_error()
+
+        login_url = f"{MOODLE_BASE_URL}/login/index.php?loginredirect=1"
+        test_driver.get(login_url)
+        user_el = WebDriverWait(test_driver, 10).until(
+            EC.visibility_of_element_located((By.ID, "username"))
+        )
+        try:
+            user_el.clear()
+        except Exception:
+            pass
+        user_el.send_keys(username)
+
+        pw_el = WebDriverWait(test_driver, 10).until(
+            EC.visibility_of_element_located((By.ID, "password"))
+        )
+        try:
+            pw_el.clear()
+        except Exception:
+            pass
+        pw_el.send_keys(password)
+
+        try:
+            test_driver.execute_script("document.getElementById('loginbtn').click();")
+        except Exception:
+            test_driver.find_element(By.ID, "loginbtn").click()
+
+        time.sleep(0.6)
+
+        def _read_danger_alert_text():
+            try:
+                el = test_driver.find_element(By.CSS_SELECTOR, "div.alert.alert-danger[role='alert']")
+                txt = (el.text or "").strip()
+                return txt or "（登入失敗，但頁面未提供錯誤文字）"
+            except Exception:
+                return None
+
+        def _classify(text: str) -> str:
+            t = (text or "").strip()
+            if not t:
+                return "未知"
+            if "驗證碼" in t or "captcha" in t.lower():
+                return "驗證碼"
+            if "帳號" in t or "學號" in t:
+                if "密碼" in t or "password" in t.lower():
+                    return "帳密"
+                return "帳號"
+            if "密碼" in t or "password" in t.lower():
+                return "密碼"
+            if "鎖" in t or "lock" in t.lower():
+                return "帳號鎖定"
+            return "登入"
+
+        # 須測試兩次（避免跳轉/渲染中瞬間狀態）
+        alert_text = None
+        for i in range(2):
+            alert_text = _read_danger_alert_text()
+            if alert_text:
+                break
+            if i == 0:
+                time.sleep(0.6)
+
+        if alert_text:
+            kind = _classify(alert_text)
+            set_last_login_error(kind, alert_text)
+            return False, kind, alert_text
+
+        # 沒看到 danger alert：再用「是否仍在登入頁」做最後判斷
+        try:
+            test_driver.find_element(By.ID, "username")
+            # 仍在登入頁但沒錯誤框，多半是網路/頁面載入異常
+            return False, None, None
+        except Exception:
+            return True, None, None
     except Exception:
-        return False
+        kind, text = get_last_login_error()
+        return False, kind, text
     finally:
         try:
             if test_driver:
@@ -1415,11 +1508,17 @@ def load_credentials():
                 
                 # 測試登入
  
-                if test_login(username, password):
+                ok, kind, text = test_login(username, password)
+
+                if ok:
 
                     break
                 else:
-                    print(f"\n{RED}X 帳號不存在或密碼錯誤，請重新輸入{RESET}")
+                    # 只有真的出現 danger alert 才輸出明確錯誤；否則避免誤判成帳密錯
+                    if text:
+                        print(f"\n{RED}X 登入失敗（{kind or '未知'}）：{text}{RESET}")
+                    else:
+                        print(f"\n{RED}X 登入失敗：未偵測到錯誤提示（可能網路/系統異常），請重試{RESET}")
                     continue
             
             # 登入成功，創建 password.txt 檔案
@@ -2123,8 +2222,6 @@ def simulate_typing(driver, element_id, text):
     """
     driver.execute_script(script)
 
-MOODLE_BASE_URL = "https://elearningv4.nuk.edu.tw"
-
 def _looks_like_login_page(driver_obj) -> bool:
     """判斷目前頁面是否看起來是登入頁。
 
@@ -2179,6 +2276,12 @@ def ensure_logged_in(driver, username, password, *, silent=False, max_retries=2)
     """
     login_url = f"{MOODLE_BASE_URL}/login/index.php?loginredirect=1"
 
+    # 避免沿用上一次的錯誤訊息
+    try:
+        clear_last_login_error()
+    except Exception:
+        pass
+
     def _is_logged_in() -> bool:
         # 以直達 /my/ 為準：若仍被導向 login 則視為未登入
         try:
@@ -2189,8 +2292,51 @@ def ensure_logged_in(driver, username, password, *, silent=False, max_retries=2)
     if _is_logged_in():
         return True
 
+    def _read_login_danger_alert_text():
+        """只在登入頁出現紅色錯誤框時回傳其文字，否則回傳 None。"""
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, "div.alert.alert-danger[role='alert']")
+            txt = (el.text or "").strip()
+            return txt or "（登入失敗，但頁面未提供錯誤文字）"
+        except Exception:
+            return None
+
+    def _classify_login_error(text: str) -> str:
+        t = (text or "").strip()
+        if not t:
+            return "未知"
+        if "驗證碼" in t or "captcha" in t.lower():
+            return "驗證碼"
+        if "帳號" in t or "學號" in t:
+            if "密碼" in t or "password" in t.lower():
+                return "帳密"
+            return "帳號"
+        if "密碼" in t or "password" in t.lower():
+            return "密碼"
+        if "鎖" in t or "lock" in t.lower():
+            return "帳號鎖定"
+        return "登入"
+
+    def _detect_login_error_twice():
+        """為避免跳轉中的瞬間狀態，連續檢查兩次錯誤框。"""
+        last_text = None
+        for i in range(2):
+            txt = _read_login_danger_alert_text()
+            if txt:
+                last_text = txt
+                break
+            if i == 0:
+                time.sleep(0.6)
+        if last_text:
+            return _classify_login_error(last_text), last_text
+        return None, None
+
     for attempt in range(max_retries):
         try:
+            try:
+                clear_last_login_error()
+            except Exception:
+                pass
             driver.get(login_url)
             user_el = WebDriverWait(driver, 10).until(
                 EC.visibility_of_element_located((By.ID, "username"))
@@ -2214,6 +2360,14 @@ def ensure_logged_in(driver, username, password, *, silent=False, max_retries=2)
 
             driver.execute_script("document.getElementById('loginbtn').click();")
             time.sleep(0.6)
+
+            # 只有真的出現 danger alert 才視為「明確的登入錯誤」。
+            kind, text = _detect_login_error_twice()
+            if text:
+                set_last_login_error(kind, text)
+                if not silent:
+                    print(f"\n{RED}X 登入失敗（{kind}）：{text}{RESET}")
+                return False
 
             # 等待不要再停留登入頁
             try:
