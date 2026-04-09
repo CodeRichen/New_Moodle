@@ -2719,11 +2719,10 @@ def try_download_google_drive(gdrive_url, dest_dir, base_name, session):
 
     return None
 
-    # 🔴 先自動開啟所有紅色課程的資料夾（已停用：不再自動開資料夾）
-if False and red_activities_to_print and not IS_FIRST_TIME and AUTO_OPEN_NEW_ACTIVITY_FOLDERS:
-   
-
-    
+    # 🔴 先自動開啟所有紅色課程的資料夾
+    # - 預設會開
+    # - 若在 password.txt 第三行之後任一行加入「nonpop」，則不會自動開啟
+if red_activities_to_print and not IS_FIRST_TIME and AUTO_OPEN_NEW_ACTIVITY_FOLDERS:
     opened_folders = set()
     for name, link, course_name, week_header, course_path, course_url, description in red_activities_to_print:
         if course_path not in opened_folders:
