@@ -136,6 +136,25 @@ def get_chrome_driver_path():
     """獲取 ChromeDriver 路徑，包含重試機制和回退方案"""
     global _cached_driver_path
 
+    # 若使用者或安裝流程已提供明確路徑，優先使用
+    env_driver = os.environ.get("CHROMEDRIVER_PATH")
+    if env_driver and os.path.exists(env_driver):
+        _cached_driver_path = env_driver
+        return _cached_driver_path
+
+    # macOS：若已安裝 Chrome for Testing，優先使用其對應 chromedriver
+    if platform.system() == "Darwin":
+        try:
+            home_dir = os.path.expanduser("~")
+            arch = (platform.machine() or "").lower()
+            plat = "mac-arm64" if "arm" in arch else "mac-x64"
+            candidate = os.path.join(home_dir, "chrome-for-testing", f"chromedriver-{plat}", "chromedriver")
+            if os.path.exists(candidate):
+                _cached_driver_path = candidate
+                return _cached_driver_path
+        except Exception:
+            pass
+
     # 允許在 Linux/Docker 環境使用系統內建的 chromedriver，
     # 避免 webdriver-manager 下載到不相容版本。
     if os.environ.get("USE_SYSTEM_CHROMEDRIVER", "0") == "1":
@@ -212,9 +231,15 @@ def apply_chrome_binary_option(chrome_options):
     return binary_path
 
 def should_use_safari_fallback():
-    """在 macOS 且找不到 Chrome 時，改用 Safari。"""
+    """在 macOS 是否回退 Safari。
+
+    依使用者要求：預設優先使用 Chrome；只有在明確指定 `FORCE_SAFARI=1` 時才回退。
+    """
+    if platform.system() != "Darwin":
+        return False
+    force_safari = os.environ.get("FORCE_SAFARI", "0").strip().lower() in {"1", "true", "yes", "on"}
     force_chrome = os.environ.get("FORCE_CHROME", "0").strip().lower() in {"1", "true", "yes", "on"}
-    return platform.system() == "Darwin" and not force_chrome and get_chrome_binary_path() is None
+    return bool(force_safari and not force_chrome)
 
 def _is_chrome_startup_issue(exc):
     """判斷是否屬於可透過更換 profile 重試的 Chrome 啟動問題。"""
@@ -799,6 +824,171 @@ def setup_chrome():
     if platform.system() != "Darwin":
         return True  # 非 macOS 不需要執行
 
+    def _macos_major_version() -> int:
+        try:
+            ver = platform.mac_ver()[0] or ""
+            parts = [int(p) for p in ver.split('.') if p.isdigit()]
+            return parts[0] if parts else 0
+        except Exception:
+            return 0
+
+    def _parse_ver_tuple(v: str):
+        try:
+            return tuple(int(x) for x in (v or "").split('.') if x.isdigit())
+        except Exception:
+            return tuple()
+
+    def _curl_download(url: str, out_path: str, *, timeout_sec: int = 420) -> bool:
+        if not url or not out_path:
+            return False
+        try:
+            cmd = [
+                "curl", "--fail", "--location",
+                "--retry", "3", "--retry-delay", "2",
+                "--connect-timeout", "20",
+                "--max-time", str(timeout_sec),
+                "-o", out_path,
+                url
+            ]
+            subprocess.run(cmd, check=True, capture_output=True, timeout=timeout_sec + 30)
+            return os.path.exists(out_path) and os.path.getsize(out_path) > 0
+        except Exception:
+            return False
+
+    def _fetch_json(url: str, *, timeout_sec: int = 20):
+        try:
+            import urllib.request
+            with urllib.request.urlopen(url, timeout=timeout_sec) as resp:
+                data = resp.read()
+            return json.loads(data.decode('utf-8', errors='ignore'))
+        except Exception:
+            return None
+
+    def _install_chrome_for_testing_major_cap(max_major: int) -> bool:
+        """安裝 Chrome for Testing + chromedriver 到 ~/chrome-for-testing（不需 sudo）。
+
+        會從 known-good 版本清單中挑選「主版號 <= max_major」的最新幾個版本嘗試。
+        """
+        arch = (platform.machine() or "").lower()
+        plat = "mac-arm64" if "arm" in arch else "mac-x64"
+
+        kjson_url = "https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json"
+        payload = _fetch_json(kjson_url, timeout_sec=25)
+        if not payload or not isinstance(payload, dict):
+            print(f"{YELLOW}! 無法取得 Chrome for Testing 版本清單，請確認網路可連線：{kjson_url}{RESET}")
+            return False
+
+        versions = payload.get("versions") or []
+        candidates = []
+        for item in versions:
+            v = (item or {}).get("version")
+            if not v:
+                continue
+            vt = _parse_ver_tuple(v)
+            if not vt:
+                continue
+            major = vt[0]
+            if major <= int(max_major):
+                candidates.append((vt, item))
+
+        if not candidates:
+            print(f"{RED}X 找不到可用的 Chrome for Testing 版本（cap={max_major}）{RESET}")
+            return False
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        candidates = candidates[:3]  # 只嘗試最新 3 個，避免花太久
+
+        home_dir = os.path.expanduser("~")
+        root_dir = os.path.join(home_dir, "chrome-for-testing")
+        os.makedirs(root_dir, exist_ok=True)
+        dl_dir = os.path.join(root_dir, "_downloads")
+        os.makedirs(dl_dir, exist_ok=True)
+
+        for vt, item in candidates:
+            version_str = (item or {}).get("version") or ""
+            downloads = (item or {}).get("downloads") or {}
+            chrome_list = downloads.get("chrome") or []
+            driver_list = downloads.get("chromedriver") or []
+
+            chrome_url = ""
+            driver_url = ""
+            for ent in chrome_list:
+                if (ent or {}).get("platform") == plat:
+                    chrome_url = (ent or {}).get("url") or ""
+                    break
+            for ent in driver_list:
+                if (ent or {}).get("platform") == plat:
+                    driver_url = (ent or {}).get("url") or ""
+                    break
+
+            if not chrome_url or not driver_url:
+                continue
+
+            print(f"{BLUE}安裝 Chrome for Testing {version_str}（{plat}）{RESET}")
+
+            chrome_zip = os.path.join(dl_dir, f"chrome-{plat}-{version_str}.zip")
+            driver_zip = os.path.join(dl_dir, f"chromedriver-{plat}-{version_str}.zip")
+
+            if not os.path.exists(chrome_zip):
+                if not _curl_download(chrome_url, chrome_zip, timeout_sec=600):
+                    print(f"{YELLOW}! 下載 Chrome for Testing 失敗，將嘗試較舊版本{RESET}")
+                    continue
+            if not os.path.exists(driver_zip):
+                if not _curl_download(driver_url, driver_zip, timeout_sec=300):
+                    print(f"{YELLOW}! 下載 chromedriver 失敗，將嘗試較舊版本{RESET}")
+                    continue
+
+            # 清掉舊資料夾（避免混到舊版本）
+            try:
+                import shutil
+                shutil.rmtree(os.path.join(root_dir, f"chrome-{plat}"), ignore_errors=True)
+                shutil.rmtree(os.path.join(root_dir, f"chromedriver-{plat}"), ignore_errors=True)
+            except Exception:
+                pass
+
+            try:
+                with zipfile.ZipFile(chrome_zip, 'r') as zf:
+                    zf.extractall(root_dir)
+                with zipfile.ZipFile(driver_zip, 'r') as zf:
+                    zf.extractall(root_dir)
+            except Exception as e:
+                print(f"{YELLOW}! 解壓失敗，將嘗試較舊版本：{e}{RESET}")
+                continue
+
+            chrome_bin = os.path.join(root_dir, f"chrome-{plat}", "Google Chrome for Testing.app", "Contents", "MacOS", "Google Chrome for Testing")
+            driver_bin = os.path.join(root_dir, f"chromedriver-{plat}", "chromedriver")
+
+            if not os.path.exists(chrome_bin) or not os.path.exists(driver_bin):
+                print(f"{YELLOW}! 安裝結果不完整，將嘗試較舊版本{RESET}")
+                continue
+
+            # 確保 chromedriver 可執行
+            try:
+                subprocess.run(["chmod", "+x", driver_bin], check=False, timeout=5)
+            except Exception:
+                pass
+
+            # 設定環境變數，讓後續 Selenium 使用這組 Chrome/Driver
+            os.environ["CHROME_BINARY"] = chrome_bin
+            os.environ["CHROMEDRIVER_PATH"] = driver_bin
+            try:
+                global _cached_driver_path
+                _cached_driver_path = driver_bin
+            except Exception:
+                pass
+
+            # 驗證：至少能跑 --version，並嘗試建立 WebDriver session
+            if not is_chrome_usable(chrome_bin):
+                print(f"{YELLOW}! Chrome 無法啟動（--version 失敗），將嘗試較舊版本{RESET}")
+                continue
+            reset_chromedriver_cache()
+            if can_start_chrome_webdriver(chrome_bin):
+                print(f"{GREEN}✓ Chrome for Testing 安裝完成：{version_str}{RESET}")
+                return True
+            print(f"{YELLOW}! Chrome WebDriver 建立失敗，將嘗試較舊版本{RESET}")
+
+        return False
+
     def is_chrome_usable(binary_path):
         """檢查 Chrome 執行檔是否可正常啟動。"""
         if not binary_path or not os.path.exists(binary_path):
@@ -885,6 +1075,17 @@ def setup_chrome():
         reset_chromedriver_cache()
     if existing_binary and not is_chrome_usable(existing_binary):
         print(f"{YELLOW}! 偵測到 Chrome 但無法啟動，將自動重新下載與修復{RESET}")
+
+    # macOS 11.x（Big Sur）：不要裝最新 stable（可能不相容），改裝 Chrome for Testing（cap 主版號）。
+    mac_major = _macos_major_version()
+    if mac_major and mac_major <= 11:
+        cap = int(os.environ.get("MACOS11_CHROME_MAJOR_CAP", "128") or "128")
+        print(f"{YELLOW}! 偵測到 macOS {platform.mac_ver()[0]}，將下載相容的 Chrome for Testing（主版號 <= {cap}）{RESET}")
+        ok = _install_chrome_for_testing_major_cap(cap)
+        if ok:
+            return True
+        print(f"{RED}X 無法安裝相容的 Chrome（macOS 11.x）。建議：升級 macOS 或自行安裝舊版 Chrome。{RESET}")
+        return False
     
     # 定義要執行的指令列表
     commands = [
@@ -1738,33 +1939,66 @@ def simulate_typing(driver, element_id, text):
     """
     driver.execute_script(script)
 
+MOODLE_BASE_URL = "https://elearningv4.nuk.edu.tw"
+
+def _looks_like_login_page(driver_obj) -> bool:
+    """判斷目前頁面是否看起來是登入頁。
+
+    不只看 URL（有時會被 redirect/帶參數），也嘗試看登入欄位是否存在。
+    """
+    try:
+        cur = (getattr(driver_obj, "current_url", "") or "").lower()
+        if "/login/" in cur or "loginredirect" in cur:
+            return True
+    except Exception:
+        pass
+    try:
+        # 只要能找到 username 或 loginbtn，通常就是登入頁
+        driver_obj.find_element(By.ID, "username")
+        return True
+    except Exception:
+        pass
+    try:
+        driver_obj.find_element(By.ID, "loginbtn")
+        return True
+    except Exception:
+        pass
+    return False
+
+def goto_my_courses_page(driver_obj, *, wait_seconds: int = 10) -> bool:
+    """嘗試進入『我的課程』頁面。
+
+    以 URL 直達為主（比點連結穩），並確認不會被導回登入頁。
+    """
+    targets = [
+        f"{MOODLE_BASE_URL}/my/courses.php",
+        f"{MOODLE_BASE_URL}/my/",
+    ]
+    for url in targets:
+        try:
+            driver_obj.get(url)
+            try:
+                WebDriverWait(driver_obj, wait_seconds).until(lambda d: not _looks_like_login_page(d))
+            except Exception:
+                pass
+            if not _looks_like_login_page(driver_obj):
+                return True
+        except Exception:
+            continue
+    return False
+
 def ensure_logged_in(driver, username, password, *, silent=False, max_retries=2) -> bool:
     """確保目前 driver 已登入 Moodle。
 
     - 若已登入：直接回傳 True
     - 若在登入頁/被重導：自動填入帳密並登入
     """
-    login_url = "https://elearningv4.nuk.edu.tw/login/index.php?loginredirect=1"
+    login_url = f"{MOODLE_BASE_URL}/login/index.php?loginredirect=1"
 
     def _is_logged_in() -> bool:
+        # 以直達 /my/ 為準：若仍被導向 login 則視為未登入
         try:
-            cur = (driver.current_url or "").lower()
-            if "login" in cur:
-                return False
-        except Exception:
-            return False
-        try:
-            # 能看到「我的課程」通常代表已登入
-            driver.find_element(By.PARTIAL_LINK_TEXT, "我的課程")
-            return True
-        except Exception:
-            pass
-        # 保底：打 /my/ 看是否還會被導去 login
-        try:
-            driver.get("https://elearningv4.nuk.edu.tw/my/")
-            time.sleep(0.2)
-            cur2 = (driver.current_url or "").lower()
-            return "login" not in cur2
+            return goto_my_courses_page(driver, wait_seconds=5)
         except Exception:
             return False
 
@@ -1774,9 +2008,14 @@ def ensure_logged_in(driver, username, password, *, silent=False, max_retries=2)
     for attempt in range(max_retries):
         try:
             driver.get(login_url)
-            WebDriverWait(driver, 10).until(
+            user_el = WebDriverWait(driver, 10).until(
                 EC.visibility_of_element_located((By.ID, "username"))
-            ).send_keys(username)
+            )
+            try:
+                user_el.clear()
+            except Exception:
+                pass
+            user_el.send_keys(username)
 
             # 密碼欄位用 simulate_typing（更貼近人類輸入）
             try:
@@ -1790,15 +2029,16 @@ def ensure_logged_in(driver, username, password, *, silent=False, max_retries=2)
                     driver.execute_script("document.getElementById('password').value = arguments[0];", password)
 
             driver.execute_script("document.getElementById('loginbtn').click();")
-            time.sleep(0.3)
+            time.sleep(0.6)
 
-            # 等待不要再停留 login
+            # 等待不要再停留登入頁
             try:
-                WebDriverWait(driver, 10).until(lambda d: "login" not in (d.current_url or "").lower())
+                WebDriverWait(driver, 12).until(lambda d: not _looks_like_login_page(d))
             except Exception:
                 pass
 
-            if _is_logged_in():
+            # 登入後直接導向『我的課程』確認 session OK
+            if goto_my_courses_page(driver, wait_seconds=10):
                 return True
         except Exception as e:
             if not silent:
@@ -1825,13 +2065,10 @@ def _relogin_best_effort(driver) -> bool:
             if not ensure_logged_in(driver, USERNAME, PASSWORD, silent=True, max_retries=2):
                 continue
             wait_local = WebDriverWait(driver, 5)
-            my_courses_link = wait_local.until(
-                EC.presence_of_element_located((By.PARTIAL_LINK_TEXT, "我的課程"))
-            )
-            my_courses_link.click()
-            time.sleep(0.2)
+            if not goto_my_courses_page(driver, wait_seconds=10):
+                continue
             select_ongoing_courses_filter(driver, wait_local)
-            if "login" not in (driver.current_url or ""):
+            if not _looks_like_login_page(driver):
                 return True
         except Exception:
             continue
@@ -1915,7 +2152,7 @@ def select_ongoing_courses_filter(driver, wait):
         return False
 
 # 登入 + 進入「我的課程」
-if not ensure_logged_in(driver, USERNAME, PASSWORD, silent=False, max_retries=2):
+if not ensure_logged_in(driver, USERNAME, PASSWORD, silent=False, max_retries=3):
     print(f"\n{RED}{'='*60}{RESET}")
     print(f"{RED}X 登入失敗：無法進入系統{RESET}")
     print(f"\n按 Enter 鍵離開...")
@@ -1925,17 +2162,27 @@ if not ensure_logged_in(driver, USERNAME, PASSWORD, silent=False, max_retries=2)
 
 try:
     wait = WebDriverWait(driver, 5)
-    my_courses_link = wait.until(EC.presence_of_element_located((By.PARTIAL_LINK_TEXT, "我的課程")))
-    my_courses_link.click()
-    time.sleep(0.2)
+    # 不點連結，直接導向更穩
+    ok_my = False
+    for _i in range(3):
+        if goto_my_courses_page(driver, wait_seconds=10):
+            ok_my = True
+            break
+        # 若被導回 login，嘗試再登入一次
+        ensure_logged_in(driver, USERNAME, PASSWORD, silent=True, max_retries=2)
+    if not ok_my:
+        raise RuntimeError("登入後仍無法進入 /my/ 或 /my/courses.php")
     select_ongoing_courses_filter(driver, wait)
 except Exception as e:
     print(f"\n{RED}{'='*60}{RESET}")
-    print(f"{RED}X 登入後無法進入『我的課程』{RESET}")
+    print(f"{RED}X 登入後無法進入『我的課程』（已重試）{RESET}")
     print(f"\n錯誤訊息：{e}")
     print(f"\n按 Enter 鍵離開...")
     input()
-    driver.quit()
+    try:
+        driver.quit()
+    except Exception:
+        pass
     sys.exit(1)
 
 def snapshot_course_hrefs(driver):
