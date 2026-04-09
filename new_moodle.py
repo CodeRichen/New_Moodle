@@ -4,6 +4,9 @@
 import os
 import sys
 import ctypes
+import contextlib
+import io
+import re
 
 # ========== 使用 Windows API 設定終端機視窗為全螢幕 ==========
 def maximize_console_window():
@@ -21,6 +24,72 @@ def maximize_console_window():
 
 # 執行視窗最大化
 maximize_console_window()
+
+# ========== 降噪：過濾 Chrome GPU 洗版錯誤（只過濾已知無害訊息） ==========
+# 例如：gpu_channel_manager.cc:919 Failed to create shared context for virtualization.
+# 這些通常不影響 Selenium 功能，但會洗版終端。
+_DISABLE_STDERR_FILTER = os.environ.get("DISABLE_STDERR_FILTER", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+if not _DISABLE_STDERR_FILTER:
+    try:
+        _NOISE_PATTERNS = [
+            re.compile(r"gpu_channel_manager\.cc", re.IGNORECASE),
+            re.compile(r"failed to create shared context for virtualization", re.IGNORECASE),
+        ]
+
+        class _StderrNoiseFilter(io.TextIOBase):
+            def __init__(self, underlying):
+                self._u = underlying
+                self._buf = ""
+
+            def write(self, s):
+                try:
+                    if not isinstance(s, str):
+                        s = str(s)
+                except Exception:
+                    return 0
+
+                self._buf += s
+                written = 0
+                while "\n" in self._buf:
+                    line, self._buf = self._buf.split("\n", 1)
+                    if any(p.search(line) for p in _NOISE_PATTERNS):
+                        continue
+                    try:
+                        self._u.write(line + "\n")
+                        written += len(line) + 1
+                    except Exception:
+                        pass
+                return written
+
+            def flush(self):
+                # flush 時，把尚未換行的內容也嘗試輸出（但仍過濾）
+                try:
+                    if self._buf:
+                        tail = self._buf
+                        self._buf = ""
+                        if not any(p.search(tail) for p in _NOISE_PATTERNS):
+                            self._u.write(tail)
+                    self._u.flush()
+                except Exception:
+                    pass
+
+            def isatty(self):
+                try:
+                    return self._u.isatty()
+                except Exception:
+                    return False
+
+            @property
+            def encoding(self):
+                try:
+                    return getattr(self._u, "encoding", "utf-8")
+                except Exception:
+                    return "utf-8"
+
+        sys.stderr = _StderrNoiseFilter(sys.stderr)
+    except Exception:
+        pass
 
 os.environ['WDM_LOG_LEVEL'] = '0' # 針對 webdriver-manager 的日誌屏蔽
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  #關閉 TensorFlow 的日誌
@@ -51,6 +120,15 @@ from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 from urllib.parse import urlparse, parse_qs
 
+@contextlib.contextmanager
+def _suppress_stdio_ctx():
+    try:
+        with open(os.devnull, 'w') as devnull:
+            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                yield
+    except Exception:
+        yield
+
 # 全域變數儲存 ChromeDriver 路徑，避免重複下載
 _cached_driver_path = None
 
@@ -70,7 +148,9 @@ def get_chrome_driver_path():
     # 嘗試使用 webdriver-manager（最多重試3次）
     for attempt in range(3):
         try:
-            _cached_driver_path = ChromeDriverManager().install()
+            # webdriver-manager 在網路不穩時可能會自行印一堆錯誤；這裡抑制輸出避免洗版
+            with _suppress_stdio_ctx():
+                _cached_driver_path = ChromeDriverManager().install()
             return _cached_driver_path
         except Exception as e:
             if attempt < 2:
@@ -143,14 +223,23 @@ def _is_chrome_startup_issue(exc):
     return any(k in msg for k in keywords)
 
 def _kill_existing_chrome_processes():
-    """殺死現有 Chrome 進程，避免衝突（Windows 專用）"""
+    """（已改為預設不使用）殺死現有 Chrome 進程（Windows）。
+
+    先前為了處理 DevToolsActivePort 等啟動問題而加入，但會把使用者正在使用的
+    Chrome 視窗全部關掉。現在改為：預設不殺 Chrome；只在明確允許時才執行。
+
+    允許方式：設定環境變數 `ALLOW_KILL_CHROME=1`。
+    """
     if os.name != 'nt':
+        return
+    allow = os.environ.get("ALLOW_KILL_CHROME", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if not allow:
         return
     try:
         import subprocess as _sp
-        _sp.run(["taskkill", "/IM", "chrome.exe", "/F"], 
+        _sp.run(["taskkill", "/IM", "chrome.exe", "/F"],
                 stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=2)
-        time.sleep(0.5)  # 留時間給系統清理資源
+        time.sleep(0.5)
     except Exception:
         pass
 
@@ -171,6 +260,8 @@ def _prepare_windows_chrome_options(chrome_options):
     
     # 基礎穩定化參數
     _add_arg("--disable-gpu")
+    # 避免 GPU 子程序反覆噴錯（特別是開啟虛擬化/遠端桌面時）
+    _add_arg("--use-gl=swiftshader")
     _add_arg("--disable-dev-shm-usage")
     _add_arg("--no-sandbox")
     _add_arg("--disable-software-rasterizer")
@@ -201,7 +292,11 @@ def create_webdriver(chrome_options=None, *, hide_windows_console=False):
         active_options = options_to_use if options_to_use is not None else chrome_options
         driver_path = get_chrome_driver_path()
         if driver_path:
-            service = Service(driver_path, log_path=os.devnull)
+            # 盡量把 ChromeDriver/Chrome 的雜訊導向 devnull，避免終端洗版
+            try:
+                service = Service(driver_path, log_output=subprocess.DEVNULL, service_args=["--log-level=OFF"])
+            except TypeError:
+                service = Service(driver_path, log_path=os.devnull)
             if os.name == 'nt' and hide_windows_console:
                 service.creation_flags = subprocess.CREATE_NO_WINDOW
             if active_options is not None:
@@ -225,38 +320,34 @@ def create_webdriver(chrome_options=None, *, hide_windows_console=False):
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                return _create_chrome_driver()
+                if attempt == 0:
+                    return _create_chrome_driver()
+
+                # 重試：一律使用獨立臨時 profile，避免與使用者已開啟的 Chrome 衝突
+                retry_options = Options()
+                if chrome_options is not None:
+                    for arg in chrome_options.arguments:
+                        if not arg.startswith("--user-data-dir="):
+                            retry_options.add_argument(arg)
+                    retry_options.page_load_strategy = chrome_options.page_load_strategy
+                    if hasattr(chrome_options, 'binary_location'):
+                        retry_options.binary_location = chrome_options.binary_location
+                    for key, value in chrome_options.experimental_options.items():
+                        retry_options.add_experimental_option(key, value)
+
+                _prepare_windows_chrome_options(retry_options)
+                fallback_dir = tempfile.mkdtemp(prefix="chrome_profile_", dir=BASE_DOWNLOAD_DIR)
+                retry_options.add_argument(f"--user-data-dir={fallback_dir}")
+                print(f"[RETRY {attempt}/{max_retries - 1}] 使用臨時 Chrome 配置檔: {fallback_dir}")
+                return _create_chrome_driver(retry_options)
             except WebDriverException as e:
                 if _is_chrome_startup_issue(e):
+                    # 不再 taskkill 使用者 Chrome；改用上方獨立 profile 重試
                     if attempt < max_retries - 1:
-                        print(f"[RETRY {attempt + 1}/{max_retries - 1}] Chrome 啟動失敗，15秒後重試...")
-                        time.sleep(5)  # 等待Chrome進程完全清理
-                        _kill_existing_chrome_processes()
-                        time.sleep(10)  # 再等待一段時間
+                        time.sleep(1)
                         continue
-                    else:
-                        # 最後一次重試用臨時 profile
-                        retry_options = Options()
-                        if chrome_options is not None:
-                            for arg in chrome_options.arguments:
-                                if not arg.startswith("--user-data-dir="):
-                                    retry_options.add_argument(arg)
-                            retry_options.page_load_strategy = chrome_options.page_load_strategy
-                            if hasattr(chrome_options, 'binary_location'):
-                                retry_options.binary_location = chrome_options.binary_location
-                            for key, value in chrome_options.experimental_options.items():
-                                retry_options.add_experimental_option(key, value)
-                        _prepare_windows_chrome_options(retry_options)
-                        
-                        # 使用臨時 profile 做最後保底
-                        fallback_dir = tempfile.mkdtemp(prefix="chrome_profile_", dir=BASE_DOWNLOAD_DIR)
-                        retry_options.add_argument(f"--user-data-dir={fallback_dir}")
-                        print(f"[FINAL RETRY] 使用臨時 Chrome 配置檔: {fallback_dir}")
-                        try:
-                            return _create_chrome_driver(retry_options)
-                        except WebDriverException as final_error:
-                            print(f"{RED}X Chrome 啟動失敗已達最大重試次數{RESET}")
-                            raise final_error
+                    print(f"{RED}X Chrome 啟動失敗已達最大重試次數{RESET}")
+                    raise
                 else:
                     raise
         
@@ -553,14 +644,34 @@ def _cleanup_temp_dl_dirs() -> None:
     - 也會保底掃描 BASE_DOWNLOAD_DIR 內所有名為 `_temp_dl` 的資料夾
     """
     import shutil
+    import stat
+
+    def _on_rm_error(func, path, exc_info):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except Exception:
+            pass
+
+    def _rmtree_retry(path: str, retries: int = 6) -> bool:
+        if not path or not os.path.isdir(path):
+            return True
+        for i in range(retries):
+            try:
+                shutil.rmtree(path, onerror=_on_rm_error)
+                return True
+            except Exception:
+                # Windows 常見：Chrome 尚未完全釋放檔案鎖，稍等重試
+                try:
+                    time.sleep(0.3 + i * 0.1)
+                except Exception:
+                    pass
+        return False
+
     # 先清理已註冊的（通常較快）
     try:
         for p in sorted(_TEMP_DL_DIRS, key=lambda s: len(s or ""), reverse=True):
-            if p and os.path.isdir(p):
-                try:
-                    shutil.rmtree(p)
-                except Exception:
-                    pass
+            _rmtree_retry(p)
     except Exception:
         pass
 
@@ -569,10 +680,7 @@ def _cleanup_temp_dl_dirs() -> None:
         for root, dirs, _files in os.walk(BASE_DOWNLOAD_DIR):
             if "_temp_dl" in dirs:
                 tmp_path = os.path.join(root, "_temp_dl")
-                try:
-                    shutil.rmtree(tmp_path)
-                except Exception:
-                    pass
+                _rmtree_retry(tmp_path)
     except Exception:
         pass
 
@@ -1481,12 +1589,52 @@ def close_macos_terminal_and_exit(code=0):
             )
         except Exception:
             pass
-    # os._exit 會跳過 atexit，故先清理暫存下載資料夾
+
+        # macOS：os._exit 會跳過 atexit，故先清理暫存下載資料夾
+        try:
+            _cleanup_temp_dl_dirs()
+        except Exception:
+            pass
+        os._exit(code)
+
+    # 非 macOS：避免 os._exit（會讓 Selenium/Chrome 還活著，導致 _temp_dl 刪不掉）
+    try:
+        # 關閉主 driver
+        _drv = globals().get('driver')
+        if _drv is not None:
+            try:
+                _drv.quit()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 關閉模擬器 driver + server（os._exit 不會跑 atexit）
+    try:
+        global _SIM_SERVER, _SIM_DRIVER
+        try:
+            if _SIM_DRIVER is not None:
+                _SIM_DRIVER.quit()
+        except Exception:
+            pass
+        try:
+            if _SIM_SERVER is not None:
+                _SIM_SERVER.shutdown()
+        except Exception:
+            pass
+        try:
+            if _SIM_SERVER is not None:
+                _SIM_SERVER.server_close()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
     try:
         _cleanup_temp_dl_dirs()
     except Exception:
         pass
-    os._exit(code)
+    raise SystemExit(code)
 
 # 載入舊活動名稱（改為解析為課程+活動 次數）
 existing_activities = set()  # 保留舊行為兼容（只含活動名或檔名）
