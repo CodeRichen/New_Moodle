@@ -7,6 +7,7 @@ import ctypes
 import contextlib
 import io
 import re
+import shutil
 
 # Moodle 主站（需要在第一次輸入帳密前就可用）
 MOODLE_BASE_URL = "https://elearningv4.nuk.edu.tw"
@@ -381,42 +382,7 @@ def create_webdriver(chrome_options=None, *, hide_windows_console=False):
             print(f"[WARN] Chrome 啟動失敗，改用 Safari。原因: {e}")
             return webdriver.Safari()
 
-    # Windows 偶發 DevToolsActivePort 問題時，自動換 profile 重試一次。
-    if os.name == 'nt':
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                if attempt == 0:
-                    return _create_chrome_driver()
-
-                # 重試：一律使用獨立臨時 profile，避免與使用者已開啟的 Chrome 衝突
-                retry_options = Options()
-                if chrome_options is not None:
-                    for arg in chrome_options.arguments:
-                        if not arg.startswith("--user-data-dir="):
-                            retry_options.add_argument(arg)
-                    retry_options.page_load_strategy = chrome_options.page_load_strategy
-                    if hasattr(chrome_options, 'binary_location'):
-                        retry_options.binary_location = chrome_options.binary_location
-                    for key, value in chrome_options.experimental_options.items():
-                        retry_options.add_experimental_option(key, value)
-
-                _prepare_windows_chrome_options(retry_options)
-                fallback_dir = tempfile.mkdtemp(prefix="chrome_profile_", dir=BASE_DOWNLOAD_DIR)
-                retry_options.add_argument(f"--user-data-dir={fallback_dir}")
-                print(f"[RETRY {attempt}/{max_retries - 1}] 使用臨時 Chrome 配置檔: {fallback_dir}")
-                return _create_chrome_driver(retry_options)
-            except WebDriverException as e:
-                if _is_chrome_startup_issue(e):
-                    # 不再 taskkill 使用者 Chrome；改用上方獨立 profile 重試
-                    if attempt < max_retries - 1:
-                        time.sleep(1)
-                        continue
-                    print(f"{RED}X Chrome 啟動失敗已達最大重試次數{RESET}")
-                    raise
-                else:
-                    raise
-        
+    # Windows：不再使用「臨時 profile 重試」邏輯（避免產生額外配置檔/行為不一致）。
     return _create_chrome_driver()
 
 # 嘗試導入 RAR 解壓工具
@@ -4615,24 +4581,7 @@ if selected_assignments:
     try:
         driver = create_webdriver(chrome_options_visible, hide_windows_console=True)
     except WebDriverException as e:
-        # Windows 偶發 DevToolsActivePort 啟動失敗：改用臨時 profile 再重試
-        if os.name == 'nt':
-            time.sleep(1)
-            chrome_options_visible_retry = Options()
-            chrome_options_visible_retry.add_argument("--log-level=3")
-            chrome_options_visible_retry.add_experimental_option("excludeSwitches", ["enable-logging"])
-            chrome_options_visible_retry.add_argument("--disable-gpu")
-            chrome_options_visible_retry.add_argument("--disable-dev-shm-usage")
-            chrome_options_visible_retry.add_argument("--remote-debugging-pipe")
-            chrome_options_visible_retry.add_argument("--disable-software-rasterizer")
-            chrome_options_visible_retry.add_argument("--no-sandbox")
-            chrome_options_visible_retry.add_argument("--disable-features=RendererCodeIntegrity")
-            submit_fallback_dir = tempfile.mkdtemp(prefix="chrome_profile_submit_fallback_", dir=BASE_DOWNLOAD_DIR)
-            chrome_options_visible_retry.add_argument(f"--user-data-dir={submit_fallback_dir}")
-            apply_chrome_binary_option(chrome_options_visible_retry)
-            driver = create_webdriver(chrome_options_visible_retry, hide_windows_console=True)
-        else:
-            raise
+        raise
 
     # 重新登入
     if not ensure_logged_in(driver, USERNAME, PASSWORD, silent=False, max_retries=2):
