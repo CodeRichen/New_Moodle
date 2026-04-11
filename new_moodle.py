@@ -768,6 +768,28 @@ IS_FIRST_TIME = False
 AUTO_OPEN_NEW_ACTIVITY_FOLDERS = True
 IS_BUILD_ENV = False
 
+def should_emit_login_failure_messages() -> bool:
+    """是否需要輸出『登入失敗』提示字樣。
+
+    只有在 password.txt 仍含 builderror（環境尚未成功建置）時才輸出，
+    避免在日常執行中因偶發網路/跳轉造成洗版。
+    """
+    try:
+        if IS_BUILD_ENV:
+            return True
+    except Exception:
+        pass
+
+    try:
+        if os.path.exists(PASSWORD_FILE):
+            with open(PASSWORD_FILE, 'r', encoding='utf-8') as f:
+                lines = f.read().splitlines()
+            return any((line or '').strip().lower() == BUILDERROR_MARKER for line in lines)
+    except Exception:
+        pass
+
+    return False
+
 def get_password_input(prompt):
     """自定義密碼輸入函數，顯示星號（Windows）或隱藏輸入（macOS/Linux）"""
     if os.name == 'nt':
@@ -1486,10 +1508,11 @@ def load_credentials():
                     break
                 else:
                     # 只有真的出現 danger alert 才輸出明確錯誤；否則避免誤判成帳密錯
-                    if text:
-                        print(f"\n{RED}X 登入失敗（{kind or '未知'}）：{text}{RESET}")
-                    else:
-                        print(f"\n{RED}X 登入失敗：未偵測到錯誤提示（可能網路/系統異常），請重試{RESET}")
+                    if should_emit_login_failure_messages():
+                        if text:
+                            print(f"\n{RED}X 登入失敗（{kind or '未知'}）：{text}{RESET}")
+                        else:
+                            print(f"\n{RED}X 登入失敗：未偵測到錯誤提示（可能網路/系統異常），請重試{RESET}")
                     continue
             
             # 登入成功，創建 password.txt 檔案
@@ -1650,15 +1673,40 @@ def build_assignment_key(course_name, act_href):
     except Exception:
         assign_id = None
     if assign_id:
-        return f"{course_name}||id:{assign_id}"
+        # id 在 Moodle 通常全站唯一，比課程名稱更穩（避免課程名變動導致快取對不上）
+        return f"id:{assign_id}"
+    # 後備：仍保留 course_name，避免非 assign id 類型連結互撞
     return f"{course_name}||url:{act_href}"
 
 def has_submitted_record(records, course_name, act_href, assignment_key):
-    if assignment_key in records:
+    if assignment_key in (records or {}):
         return True
-    for rec in (records or {}).values():
-        if isinstance(rec, dict) and rec.get('course') == course_name and rec.get('url') == act_href:
+
+    # 以 id 為主做比對（即使 course_name 不同也能對上）
+    aid = None
+    try:
+        q = parse_qs(urlparse(act_href).query)
+        aid = (q.get('id') or [None])[0]
+        if aid and f"id:{aid}" in (records or {}):
             return True
+    except Exception:
+        pass
+
+    for rec in (records or {}).values():
+        if isinstance(rec, dict):
+            # 舊資料：用 course+url
+            if rec.get('course') == course_name and rec.get('url') == act_href:
+                return True
+            # 新資料：用 id
+            try:
+                rurl = rec.get('url') or ''
+                q2 = parse_qs(urlparse(rurl).query)
+                rid = (q2.get('id') or [None])[0]
+                if aid and rid and str(aid) == str(rid):
+                    return True
+            except Exception:
+                pass
+            continue
     return False
 
 def parse_due_datetime(due_date_str):
@@ -1868,6 +1916,75 @@ def check_assignments_inline(driver_obj, assignments, *, submitted_assignments, 
     return submitted_assignments, pending_cache
 
 
+def recheck_pending_assignments(driver_obj, *, pending_cache, submitted_assignments, limit=6):
+    """對少量「已在 pending_cache」的作業做再驗證。
+
+    原本 pending_cache 內的作業為了加速會被跳過檢查；若使用者已在網頁上完成繳交，
+    可能會暫時殘留在未繳交清單。這裡用小額度重新檢查，將已繳交者移出 pending。
+    """
+    try:
+        limit = max(0, int(limit or 0))
+    except Exception:
+        limit = 0
+    if limit <= 0:
+        return submitted_assignments, pending_cache
+
+    import datetime
+    now_dt = datetime.datetime.now()
+
+    items = list((pending_cache or {}).items())
+    # 越接近截止越優先檢查
+    items.sort(key=lambda kv: (kv[1].get('due_date_obj') or datetime.datetime.max))
+
+    checked = 0
+    for key, item in items:
+        if checked >= limit:
+            break
+        try:
+            url = item.get('url')
+            course = item.get('course') or ''
+            name = item.get('name') or ''
+            if not url:
+                continue
+
+            # 若已在 submitted 記錄中，直接移除
+            stable_key = build_assignment_key(course, url)
+            if has_submitted_record(submitted_assignments, course, url, stable_key):
+                pending_cache.pop(key, None)
+                continue
+
+            driver_obj.get(url)
+            time.sleep(0.15)
+
+            status_text = ""
+            try:
+                status_cell = driver_obj.find_element(By.XPATH, "//th[contains(text(), '繳交狀態')]/following-sibling::td")
+                status_text = (status_cell.text or '').strip()
+            except Exception:
+                status_text = ""
+
+            if status_text and any(k in status_text for k in ["已繳交", "已提交", "已送出"]):
+                submitted_assignments[stable_key] = {
+                    'course': course,
+                    'name': name,
+                    'url': url,
+                    'assignment_key': stable_key,
+                    'checked_date': time.strftime('%Y-%m-%d %H:%M:%S')
+                }
+                pending_cache.pop(key, None)
+            else:
+                # 若已過期就移除（避免殘留）
+                if is_expired_assignment(item, now_dt):
+                    pending_cache.pop(key, None)
+
+            checked += 1
+        except Exception:
+            checked += 1
+            continue
+
+    return submitted_assignments, pending_cache
+
+
 def check_assignments_background_early(course_hrefs_snapshot, username, password):
     """用獨立 WebDriver 在程式一開始就背景檢查未繳交作業。
 
@@ -1916,8 +2033,8 @@ def check_assignments_background_early(course_hrefs_snapshot, username, password
         bg_driver = create_webdriver(bg_options, hide_windows_console=True)
 
         # 登入（避免依賴主流程的 driver）
-        if not ensure_logged_in(bg_driver, username, password, silent=True, max_retries=2):
-            raise RuntimeError("背景作業檢查登入失敗")
+        if not ensure_logged_in_retry_once(bg_driver, username, password, silent=True, max_retries=2):
+            raise RuntimeError("背景作業檢查登入未成功")
 
         # 開始檢查課程作業
         for course_href in list(course_hrefs_snapshot or []):
@@ -2338,7 +2455,7 @@ def ensure_logged_in(driver, username, password, *, silent=False, max_retries=2)
             kind, text = _detect_login_error_twice()
             if text:
                 set_last_login_error(kind, text)
-                if not silent:
+                if (not silent) and should_emit_login_failure_messages():
                     print(f"\n{RED}X 登入失敗（{kind}）：{text}{RESET}")
                 return False
 
@@ -2352,7 +2469,7 @@ def ensure_logged_in(driver, username, password, *, silent=False, max_retries=2)
             if goto_my_courses_page(driver, wait_seconds=10):
                 return True
         except Exception as e:
-            if not silent:
+            if (not silent) and should_emit_login_failure_messages():
                 try:
                     print(f"{YELLOW}! 自動登入失敗，重試中... ({attempt+1}/{max_retries}){RESET}")
                 except Exception:
@@ -2363,6 +2480,22 @@ def ensure_logged_in(driver, username, password, *, silent=False, max_retries=2)
             return False
 
     return False
+
+def ensure_logged_in_retry_once(driver, username, password, *, silent=False, max_retries=2) -> bool:
+    """登入失敗時，再額外重試一次（外層重試）。
+
+    避免偶發網路/跳轉造成的單次失敗。
+    """
+    ok = ensure_logged_in(driver, username, password, silent=silent, max_retries=max_retries)
+    if ok:
+        return True
+    if not silent:
+        try:
+            # print(f"{YELLOW}! 登入失敗，將再重試一次...{RESET}")
+            pass
+        except Exception:
+            pass
+    return ensure_logged_in(driver, username, password, silent=silent, max_retries=max_retries)
 
 def login_to_moodle(driver):
     """執行登入流程"""
@@ -2394,7 +2527,7 @@ def _recreate_main_driver_or_raise():
         pass
     driver = create_webdriver(chrome_options, hide_windows_console=True)
     if not _relogin_best_effort(driver):
-        raise RuntimeError("重新登入失敗（主瀏覽器已重建）。")
+        raise RuntimeError("重新登入未成功（主瀏覽器已重建）。")
     return driver
 
 def _open_course_tabs_with_retry(course_hrefs_list):
@@ -2515,9 +2648,12 @@ def select_ongoing_courses_filter(driver, wait):
         return False
 
 # 登入 + 進入「我的課程」
-if not ensure_logged_in(driver, USERNAME, PASSWORD, silent=False, max_retries=3):
+if not ensure_logged_in_retry_once(driver, USERNAME, PASSWORD, silent=False, max_retries=3):
     print(f"\n{RED}{'='*60}{RESET}")
-    print(f"{RED}X 登入失敗：無法進入系統{RESET}")
+    if should_emit_login_failure_messages():
+        print(f"{RED}X 登入失敗：無法進入系統{RESET}")
+    else:
+        print(f"{RED}X 無法進入系統{RESET}")
     print(f"\n按 Enter 鍵離開...")
     input()
     driver.quit()
@@ -4501,6 +4637,17 @@ pending_cache = load_pending_assignments()
 _now_dt = datetime.datetime.now()
 pending_cache = {k: v for k, v in pending_cache.items() if not is_expired_assignment(v, _now_dt)}
 
+# 先把「其實已繳交」的從 pending_cache 清掉（用 id 比對，避免課程名變動導致殘留）
+try:
+    for _k, _it in list(pending_cache.items()):
+        _course = _it.get('course') or ''
+        _url = _it.get('url') or ''
+        _key = build_assignment_key(_course, _url)
+        if has_submitted_record(submitted_assignments, _course, _url, _key):
+            pending_cache.pop(_k, None)
+except Exception:
+    pass
+
 # 2) 從本次「最新消息」抓到的課程頁資料中拿到作業清單（不額外開分頁）
 all_assignments_found = []
 for _idx, _res in course_results:
@@ -4520,6 +4667,22 @@ try:
     save_submitted_assignments(submitted_assignments)
 except Exception:
     # 檢查失敗不阻擋主流程
+    pass
+
+# 3.5) 少量 recheck：避免「已繳交但仍殘留在未繳」
+try:
+    recheck_limit = int(os.environ.get('PENDING_RECHECK_LIMIT', '6') or '6')
+except Exception:
+    recheck_limit = 6
+try:
+    submitted_assignments, pending_cache = recheck_pending_assignments(
+        driver,
+        pending_cache=pending_cache,
+        submitted_assignments=submitted_assignments,
+        limit=recheck_limit,
+    )
+    save_submitted_assignments(submitted_assignments)
+except Exception:
     pass
 
 # 4) 組出要顯示的未繳作業清單（只顯示未過期）
@@ -4584,7 +4747,7 @@ if selected_assignments:
         raise
 
     # 重新登入
-    if not ensure_logged_in(driver, USERNAME, PASSWORD, silent=False, max_retries=2):
+    if not ensure_logged_in_retry_once(driver, USERNAME, PASSWORD, silent=False, max_retries=2):
         try:
             driver.quit()
         except Exception:
@@ -4613,6 +4776,41 @@ if selected_assignments:
                 # 常見：已繳交作業 / 已繳交 / 已提交
                 if any(k in status_text for k in ["已繳交", "已提交", "已送出"]):
                     print(f"  {GREEN}✓ 已繳交{RESET} [{assignment.get('course','')}] {assignment.get('name','')}")
+                    try:
+                        _course = assignment.get('course') or ''
+                        _url = assignment.get('url') or ''
+                        _name = assignment.get('name') or ''
+                        _akey = build_assignment_key(_course, _url)
+                        submitted_assignments[_akey] = {
+                            'course': _course,
+                            'name': _name,
+                            'url': _url,
+                            'assignment_key': _akey,
+                            'checked_date': time.strftime('%Y-%m-%d %H:%M:%S')
+                        }
+                        pending_cache.pop(_akey, None)
+
+                        # 若 pending_cache 還是舊 key（例如 course+url），再用 URL / id 進一步清掉
+                        try:
+                            import re as _re
+                            _aid = None
+                            m = _re.search(r"[?&]id=(\d+)", _url)
+                            if m:
+                                _aid = m.group(1)
+
+                            for _pk, _pv in list((pending_cache or {}).items()):
+                                _pu = ((_pv or {}).get('url') or '').strip()
+                                if _pu and _pu == _url:
+                                    pending_cache.pop(_pk, None)
+                                    continue
+                                if _aid and _pu:
+                                    m2 = _re.search(r"[?&]id=(\d+)", _pu)
+                                    if m2 and m2.group(1) == _aid:
+                                        pending_cache.pop(_pk, None)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
                     continue
 
             # 仍可嘗試點擊「繳交作業」按鈕（未繳交時）
@@ -4644,6 +4842,13 @@ if selected_assignments:
     try:
         driver.quit()
     except:
+        pass
+
+    # 將已繳交更新寫回快取（避免下次仍顯示未繳）
+    try:
+        save_submitted_assignments(submitted_assignments)
+        save_pending_assignments(pending_cache)
+    except Exception:
         pass
     sys.exit()
 
