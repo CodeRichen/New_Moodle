@@ -1891,8 +1891,19 @@ def check_assignments_inline(driver_obj, assignments, *, submitted_assignments, 
                     'due_date_str': due_date_str,
                     'due_date_obj': due_dt,
                 }
-                # 過期的不進 pending（也不顯示）
-                if not is_expired_assignment(item, now_dt):
+                # 若已繳交或已過期，皆記錄為已處理（寫入 submitted_assignments 以後不要再點進去了）
+                if is_expired_assignment(item, now_dt):
+                    newly_submitted[key] = {
+                        'course': a['course'],
+                        'name': a['name'],
+                        'url': a['url'],
+                        'assignment_key': key,
+                        'checked_date': time.strftime('%Y-%m-%d %H:%M:%S'),
+                        'status': 'expired'
+                    }
+                    if key in pending_cache:
+                        pending_cache.pop(key, None)
+                else:
                     pending_cache[key] = item
             else:
                 # 沒看到繳交按鈕也沒明確狀態：當作已繳交/無需繳交，避免一直卡在 pending
@@ -1916,12 +1927,15 @@ def check_assignments_inline(driver_obj, assignments, *, submitted_assignments, 
     return submitted_assignments, pending_cache
 
 
-def recheck_pending_assignments(driver_obj, *, pending_cache, submitted_assignments, limit=6):
+def recheck_pending_assignments(driver_obj, *, pending_cache, submitted_assignments, limit=None):
     """對少量「已在 pending_cache」的作業做再驗證。
 
     原本 pending_cache 內的作業為了加速會被跳過檢查；若使用者已在網頁上完成繳交，
     可能會暫時殘留在未繳交清單。這裡用小額度重新檢查，將已繳交者移出 pending。
     """
+    # limit=None 代表全部檢查（最可靠，避免已繳交仍殘留在未繳清單）
+    if limit is None:
+        limit = len(pending_cache or {})
     try:
         limit = max(0, int(limit or 0))
     except Exception:
@@ -1973,9 +1987,55 @@ def recheck_pending_assignments(driver_obj, *, pending_cache, submitted_assignme
                 }
                 pending_cache.pop(key, None)
             else:
-                # 若已過期就移除（避免殘留）
-                if is_expired_assignment(item, now_dt):
-                    pending_cache.pop(key, None)
+                # 若抓不到狀態文字，改用「是否還能繳交」判斷：
+                # 找不到「繳交作業」按鈕，通常代表已繳交/無需繳交，避免一直殘留在未繳清單。
+                try:
+                    has_submit_button = False
+                    try:
+                        submit_buttons = driver_obj.find_elements(By.XPATH, "//button[contains(text(), '繳交作業')]")
+                        if submit_buttons:
+                            has_submit_button = True
+                    except Exception:
+                        pass
+
+                    if (not has_submit_button) and status_text and (
+                        "尚無任何作業繳交" in status_text or "目前尚無" in status_text
+                    ):
+                        has_submit_button = True
+
+                    if not has_submit_button:
+                        submitted_assignments[stable_key] = {
+                            'course': course,
+                            'name': name,
+                            'url': url,
+                            'assignment_key': stable_key,
+                            'checked_date': time.strftime('%Y-%m-%d %H:%M:%S')
+                        }
+                        pending_cache.pop(key, None)
+                    else:
+                        # 若已過期就移除（寫入 submitted_assignments 以避免殘留與重複驗證）
+                        if is_expired_assignment(item, now_dt):
+                            submitted_assignments[stable_key] = {
+                                'course': course,
+                                'name': name,
+                                'url': url,
+                                'assignment_key': stable_key,
+                                'checked_date': time.strftime('%Y-%m-%d %H:%M:%S'),
+                                'status': 'expired'
+                            }
+                            pending_cache.pop(key, None)
+                except Exception:
+                    # 若已過期就移除（寫入 submitted_assignments 以避免殘留與重複驗證）
+                    if is_expired_assignment(item, now_dt):
+                        submitted_assignments[stable_key] = {
+                            'course': course,
+                            'name': name,
+                            'url': url,
+                            'assignment_key': stable_key,
+                            'checked_date': time.strftime('%Y-%m-%d %H:%M:%S'),
+                            'status': 'expired'
+                        }
+                        pending_cache.pop(key, None)
 
             checked += 1
         except Exception:
@@ -4625,17 +4685,37 @@ if IS_FIRST_TIME:
     cleanup_thread.start()
     close_macos_terminal_and_exit(0)
 
-print(f"{PINK}開啟未繳交作業（可用空白分隔多個編號）：{RESET}\n")
-
 import datetime
 
 # 1) 從文字檔載入上次未繳交作業（加速）
 submitted_assignments = load_submitted_assignments()
 pending_cache = load_pending_assignments()
 
-# 清掉已過期（不顯示）
+# 清掉已過期（不顯示），並且把它們加入已處理快取（submitted_assignments）
+# 以避免未來程式又把它們當成新作業點進去驗證！
 _now_dt = datetime.datetime.now()
-pending_cache = {k: v for k, v in pending_cache.items() if not is_expired_assignment(v, _now_dt)}
+_new_pending = {}
+_newly_ignored = {}
+for k, v in pending_cache.items():
+    if is_expired_assignment(v, _now_dt):
+        _newly_ignored[k] = {
+            'course': v.get('course', ''),
+            'name': v.get('name', ''),
+            'url': v.get('url', ''),
+            'assignment_key': k,
+            'checked_date': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'status': 'expired'
+        }
+    else:
+        _new_pending[k] = v
+
+pending_cache = _new_pending
+if _newly_ignored:
+    submitted_assignments.update(_newly_ignored)
+    try:
+        save_submitted_assignments(submitted_assignments)
+    except Exception:
+        pass
 
 # 先把「其實已繳交」的從 pending_cache 清掉（用 id 比對，避免課程名變動導致殘留）
 try:
@@ -4657,12 +4737,23 @@ for _idx, _res in course_results:
 
 # 3) 限量檢查新作業（不在 pending/submitted 的），用主 driver 直接進入頁面判斷
 try:
+    # 預設：全部檢查（只會檢查「不在 pending/submitted」的新作業）。
+    # 若要加速，可設定環境變數 ASSIGNMENT_CHECK_LIMIT。
+    try:
+        _env_check_limit = os.environ.get('ASSIGNMENT_CHECK_LIMIT', '').strip()
+    except Exception:
+        _env_check_limit = ''
+    if _env_check_limit:
+        _check_limit = int(_env_check_limit)
+    else:
+        _check_limit = len(all_assignments_found or [])
+
     submitted_assignments, pending_cache = check_assignments_inline(
         driver,
         all_assignments_found,
         submitted_assignments=submitted_assignments,
         pending_cache=pending_cache,
-        limit=ASSIGNMENT_CHECK_LIMIT
+        limit=_check_limit
     )
     save_submitted_assignments(submitted_assignments)
 except Exception:
@@ -4671,9 +4762,20 @@ except Exception:
 
 # 3.5) 少量 recheck：避免「已繳交但仍殘留在未繳」
 try:
-    recheck_limit = int(os.environ.get('PENDING_RECHECK_LIMIT', '6') or '6')
+    _env_limit = os.environ.get('PENDING_RECHECK_LIMIT', '').strip().lower()
+    if not _env_limit:
+        # 預設：全數 recheck（最可靠）
+        recheck_limit = None
+    elif _env_limit == 'all':
+        recheck_limit = None
+    elif _env_limit == 'auto':
+        # 自動模式：pending 不多則全數，過多則只檢查最接近截止的前 N 筆
+        _pending_n = len(pending_cache or {})
+        recheck_limit = _pending_n if _pending_n <= 30 else 30
+    else:
+        recheck_limit = int(_env_limit)
 except Exception:
-    recheck_limit = 6
+    recheck_limit = None
 try:
     submitted_assignments, pending_cache = recheck_pending_assignments(
         driver,
@@ -4689,6 +4791,17 @@ except Exception:
 empty_assignments = list(pending_cache.values())
 empty_assignments = [a for a in empty_assignments if not is_expired_assignment(a, _now_dt)]
 empty_assignments.sort(key=lambda x: x.get('due_date_obj', datetime.datetime.max) if x.get('due_date_obj') else datetime.datetime.max)
+
+# 如果沒有任何「未繳且未過期」作業：不顯示輸入編號提示，直接結束
+if not empty_assignments:
+    try:
+        save_pending_assignments(pending_cache)
+    except Exception:
+        pass
+    print(f"{GREEN}目前無須繳交作業{RESET}")
+    close_macos_terminal_and_exit(0)
+
+print(f"{PINK}開啟未繳交作業（可用空白分隔多個編號）：{RESET}\n")
 
 items_list = []
 current_idx = 1
