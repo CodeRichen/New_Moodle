@@ -670,11 +670,7 @@ def _register_temp_dl_dir(path: str) -> None:
         pass
 
 def _cleanup_temp_dl_dirs() -> None:
-    """刪除所有課程的 `_temp_dl` 暫存資料夾。
-
-    - 會清理已註冊的資料夾
-    - 也會保底掃描 BASE_DOWNLOAD_DIR 內所有名為 `_temp_dl` 的資料夾
-    """
+    """刪除所有課程的 `_temp_dl` 暫存資料夾。只清理已登錄的新下載資料夾，不遍歷全目錄。"""
     import shutil
     import stat
 
@@ -700,19 +696,11 @@ def _cleanup_temp_dl_dirs() -> None:
                     pass
         return False
 
-    # 先清理已註冊的（通常較快）
+    # 僅清理已註冊的（不再 os.walk 整個大目錄）
     try:
         for p in sorted(_TEMP_DL_DIRS, key=lambda s: len(s or ""), reverse=True):
             _rmtree_retry(p)
-    except Exception:
-        pass
-
-    # 保底：掃描目錄下所有 `_temp_dl`
-    try:
-        for root, dirs, _files in os.walk(BASE_DOWNLOAD_DIR):
-            if "_temp_dl" in dirs:
-                tmp_path = os.path.join(root, "_temp_dl")
-                _rmtree_retry(tmp_path)
+        _TEMP_DL_DIRS.clear()
     except Exception:
         pass
 
@@ -3224,12 +3212,9 @@ def remove_zone_identifier(filepath):
     if os.name != 'nt':
         return  # macOS / Linux 無此機制
     try:
-        subprocess.run(
-            ["powershell", "-Command", f"Unblock-File -Path '{filepath}'"],
-            capture_output=True,
-            timeout=5
-        )
-    except Exception:
+        zone_path = filepath + ":Zone.Identifier"
+        os.remove(zone_path)
+    except OSError:
         pass
 
 def unblock_office_files_in_dir(root_dir):
@@ -3844,7 +3829,7 @@ if red_activities_to_print:
                                     with open(file_path, 'wb') as f:
                                         for chunk in response.iter_content(chunk_size=8192):
                                             f.write(chunk)
-                                    files_to_unblock.append(file_path)
+                                    remove_zone_identifier(file_path)
                                     downloaded_files.add(filename)
                                     existing_files.add(filename)
                                     total_downloaded_files += 1
@@ -3866,7 +3851,7 @@ if red_activities_to_print:
                                         with open(file_path, 'wb') as f:
                                             for chunk in response.iter_content(chunk_size=8192):
                                                 f.write(chunk)
-                                        files_to_unblock.append(file_path)
+                                        remove_zone_identifier(file_path)
                                         downloaded_files.add(filename)
                                         existing_files.add(filename)
                                         total_downloaded_files += 1
@@ -3926,7 +3911,7 @@ if red_activities_to_print:
                                     with open(fp, 'wb') as f:
                                         for chunk in rsp.iter_content(chunk_size=8192):
                                             f.write(chunk)
-                                    files_to_unblock.append(fp)
+                                    remove_zone_identifier(fp)
                                     downloaded_files.add(redirect_filename)
                                     existing_files.add(redirect_filename)
                                     total_downloaded_files += 1
@@ -3987,7 +3972,7 @@ if red_activities_to_print:
                                 print(f"{RED}X 檔案移動失敗: {e}{RESET}")
                                 continue
                             
-                            files_to_unblock.append(file_path)
+                            remove_zone_identifier(file_path)
                             downloaded_files.add(filename)
                             existing_files.add(filename)
                             total_downloaded_files += 1
@@ -4041,7 +4026,7 @@ if red_activities_to_print:
                                         print(f"{RED}X 檔案移動失敗: {e}{RESET}")
                                         continue
                                     
-                                    files_to_unblock.append(file_path)
+                                    remove_zone_identifier(file_path)
                                     downloaded_files.add(base_filename)
                                     existing_files.add(base_filename)
                                     total_downloaded_files += 1
@@ -4081,7 +4066,7 @@ if red_activities_to_print:
                                     with open(fp, 'wb') as f:
                                         for chunk in rsp.iter_content(chunk_size=8192):
                                             f.write(chunk)
-                                    files_to_unblock.append(fp)
+                                    remove_zone_identifier(fp)
                                     downloaded_files.add(res_filename)
                                     existing_files.add(res_filename)
                                     total_downloaded_files += 1
@@ -4129,7 +4114,7 @@ if red_activities_to_print:
                                 continue
                             
                             # print(f"{GREEN}✅ 下載完成：{filename} ({file_size / 1024:.1f} KB){RESET}")
-                            files_to_unblock.append(file_path)
+                            remove_zone_identifier(file_path)
                             downloaded_files.add(filename)
                             existing_files.add(filename)
                             total_downloaded_files += 1
@@ -4290,7 +4275,7 @@ if red_activities_to_print:
                                     if chunk:
                                         f.write(chunk)
                             
-                            files_to_unblock.append(file_path)
+                            remove_zone_identifier(file_path)
                             downloaded_files.add(filename)
                             existing_files.add(filename)
                             total_downloaded_files += 1
@@ -4344,7 +4329,7 @@ if red_activities_to_print:
                                         session = create_session_with_cookies()
                                         fp = try_download_google_drive(actual_url, course_path, safe_filename, session)
                                         if fp:
-                                            files_to_unblock.append(fp)
+                                            remove_zone_identifier(fp)
                                             existing_files.add(os.path.basename(fp))
                                             total_downloaded_files += 1
                                         else:
@@ -4497,7 +4482,7 @@ if red_activities_to_print:
                             if is_gdrive:
                                 fp = try_download_google_drive(furl, course_path, base_name, session)
                                 if fp:
-                                    files_to_unblock.append(fp)
+                                    remove_zone_identifier(fp)
                                     downloaded_files.add(os.path.basename(fp))
                                     existing_files.add(os.path.basename(fp))
                                     total_downloaded_files += 1
@@ -4541,7 +4526,7 @@ if red_activities_to_print:
                                 with open(fp, 'wb') as f:
                                     for chunk in rsp.iter_content(chunk_size=8192):
                                         f.write(chunk)
-                                files_to_unblock.append(fp)
+                                remove_zone_identifier(fp)
                                 downloaded_files.add(pfl_name)
                                 existing_files.add(pfl_name)
                                 total_downloaded_files += 1
@@ -4588,21 +4573,14 @@ if red_activities_to_print:
             # print(f"{RED}X 處理活動時發生錯誤: {e}{RESET}")
             pass
 
-    # 刪除所有課程因下載而產生的暫存資料夾（確保結束後能清空）
-    _cleanup_temp_dl_dirs()
-
-    # 所有下載完成後，統一移除 Zone.Identifier
-    # print(f"\n📊 下載統計：共下載 {total_downloaded_files} 個檔案")
-    # print(f"🔍 待解除封鎖的檔案數量：{len(files_to_unblock)}")
-    
-    
-    if files_to_unblock:
-        for file_path in files_to_unblock:
-            try:
-                remove_zone_identifier(file_path)
-            except Exception as e:
-                # 靜默失敗，不影響主流程
-                pass
+    # 刪除本課程因下載而產生的暫存資料夾（確保結束後能清空）
+    import shutil
+    if os.path.exists(temp_dl_dir):
+        shutil.rmtree(temp_dl_dir, ignore_errors=True)
+    try:
+        _TEMP_DL_DIRS.discard(temp_dl_dir)
+    except Exception:
+        pass
 
 # 資源檔案使用 requests 直接下載，不會產生 .crdownload
 # 資料夾/作業下載若有問題，wait_for_download() 會在當下處理
@@ -4641,20 +4619,6 @@ if failed_extract and not IS_FIRST_TIME:
     print(f"\n💡 建議安裝 patool（自動支持多種解壓工具）：")
     print(f"   {BLUE}pip install patool{RESET}")
     print(f"   或手動下載 UnRAR: https://www.rarlab.com/rar_add.htm")
-
-# 最終保險：確保 Word/PPT/PDF 檔案都已解除封鎖
-def _run_unblock_in_background(root_dir):
-    """背景執行檔案解除封鎖，避免阻塞互動提示。"""
-    try:
-        unblock_office_files_in_dir(root_dir)
-    except Exception:
-        pass
-
-threading.Thread(
-    target=_run_unblock_in_background,
-    args=(download_dir,),
-    daemon=True
-).start()
 
 # 按照課程名稱字母順序整理輸出並更新 output.txt
 course_results.sort(key=lambda x: x[1]['course_name'])  # 按課程名稱字母排序
