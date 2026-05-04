@@ -132,7 +132,7 @@ import zipfile
 import py7zr
 import requests  # 用於直接下載圖片
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from collections import defaultdict
 import json
 from selenium import webdriver
@@ -2697,11 +2697,11 @@ def select_ongoing_courses_filter(driver, wait):
 
 # 登入 + 進入「我的課程」
 if not ensure_logged_in_retry_once(driver, USERNAME, PASSWORD, silent=False, max_retries=3):
-    print(f"\n{RED}{'='*60}{RESET}")
+    # print(f"\n{RED}{'='*60}{RESET}")
     if should_emit_login_failure_messages():
         print(f"{RED}X 登入失敗：無法進入系統{RESET}")
     else:
-        print(f"{RED}X 無法進入系統{RESET}")
+        print(f"{RED}X 臨時錯誤，可再次執行程式{RESET}")
     print(f"\n按 Enter 鍵離開...")
     input()
     driver.quit()
@@ -3080,14 +3080,9 @@ def process_extracted_data(tab_handle, data, href):
     for block in reversed(week_logs):
         course_activity_log.extend(block)
     
-    # 將活動記錄寫入課程資料夾中的文字檔
+    # 不在這裡直接寫入，改由主執行緒統一寫入以減少 I/O 瓶頸
     activity_log_path = os.path.join(course_path, "課程活動記錄.txt")
-    try:
-        with open(activity_log_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(course_activity_log))
-        os.utime(activity_log_path, None)  # 更新時間戳，確保檔案保持最新
-    except Exception as e:
-        print(f"{RED}! 無法寫入活動記錄: {course_name} - {e}{RESET}")
+    
     
     return {
         'course_name': course_name,
@@ -3097,7 +3092,9 @@ def process_extracted_data(tab_handle, data, href):
         'latest_with_content': latest_with_content,
         'current_week_info': current_week_info,
         'next_week_info': next_week_info,
-        'failed_downloads': []
+        'failed_downloads': [],
+        'activity_log_path': activity_log_path,
+        'course_activity_log': course_activity_log
     }
 
 # 使用線程池並行處理數據（真正的並行）
@@ -3113,6 +3110,17 @@ with ThreadPoolExecutor(max_workers=len(all_tabs)) as executor:
         result = future.result()
         tab_handle, idx = future_to_tab[future]
         if result:
+            # 集中在此處統一進行檔案 I/O 寫入
+            activity_log_path = result.get('activity_log_path')
+            course_activity_log = result.get('course_activity_log')
+            if activity_log_path and course_activity_log:
+                try:
+                    with open(activity_log_path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(course_activity_log))
+                    os.utime(activity_log_path, None)  # 更新時間戳，確保檔案保持最新
+                except Exception as e:
+                    print(f"{RED}! 無法寫入活動記錄: {result['course_name']} - {e}{RESET}")
+                
             course_results.append((idx, result))  # 保存索引
             
             # 立即輸出黃色資訊（本週、下週、最新週的舊活動）
@@ -3968,6 +3976,10 @@ if red_activities_to_print:
                             file_path = ensure_unique_filename(os.path.join(course_path, filename))
                             try:
                                 shutil.move(temp_file_path, file_path)
+                                # 移出後檢查暫存資料夾是否淨空，若是則立即刪除
+                                if os.path.exists(temp_dl_dir) and not os.listdir(temp_dl_dir):
+                                    shutil.rmtree(temp_dl_dir, ignore_errors=True)
+                                    _TEMP_DL_DIRS.discard(temp_dl_dir)
                             except Exception as e:
                                 print(f"{RED}X 檔案移動失敗: {e}{RESET}")
                                 continue
@@ -4022,6 +4034,10 @@ if red_activities_to_print:
                                     file_path = ensure_unique_filename(os.path.join(course_path, base_filename))
                                     try:
                                         shutil.move(temp_file_path, file_path)
+                                        # 移出後檢查暫存資料夾是否淨空，若是則立即刪除
+                                        if os.path.exists(temp_dl_dir) and not os.listdir(temp_dl_dir):
+                                            shutil.rmtree(temp_dl_dir, ignore_errors=True)
+                                            _TEMP_DL_DIRS.discard(temp_dl_dir)
                                     except Exception as e:
                                         print(f"{RED}X 檔案移動失敗: {e}{RESET}")
                                         continue
@@ -4572,15 +4588,6 @@ if red_activities_to_print:
         except Exception as e:
             # print(f"{RED}X 處理活動時發生錯誤: {e}{RESET}")
             pass
-
-    # 刪除本課程因下載而產生的暫存資料夾（確保結束後能清空）
-    import shutil
-    if os.path.exists(temp_dl_dir):
-        shutil.rmtree(temp_dl_dir, ignore_errors=True)
-    try:
-        _TEMP_DL_DIRS.discard(temp_dl_dir)
-    except Exception:
-        pass
 
 # 資源檔案使用 requests 直接下載，不會產生 .crdownload
 # 資料夾/作業下載若有問題，wait_for_download() 會在當下處理
